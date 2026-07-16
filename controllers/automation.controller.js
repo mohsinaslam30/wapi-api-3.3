@@ -59,12 +59,15 @@ export const getAutomationFlows = async (req, res) => {
     const { sortField, sortOrder } = parseSortParams(req.query);
     const searchQuery = buildSearchQuery(req.query.search);
 
-    const { is_active = '', status = '' } = req.query;
+    const { is_active = '', status = '', platform = '' } = req.query;
 
     searchQuery.user_id = userId;
     searchQuery.deleted_at = null;
     if (workspaceId) {
       searchQuery.workspace_id = workspaceId;
+    }
+    if (platform) {
+      searchQuery.platform = platform;
     }
 
     if (status === 'active') {
@@ -225,6 +228,34 @@ export const updateAutomationFlow = async (req, res) => {
       });
     }
 
+  if (nodes !== undefined && Array.isArray(nodes)) {
+      const prevChatbotIds = new Set(
+        (flow.nodes || [])
+          .filter(n => n.type === 'assign_chatbot' && n.parameters?.chatbot_id)
+          .map(n => String(n.parameters.chatbot_id))
+      );
+      const newChatbotIds = new Set(
+        nodes
+          .filter(n => n.type === 'assign_chatbot' && n.parameters?.chatbot_id)
+          .map(n => String(n.parameters.chatbot_id))
+      );
+
+      const removedChatbotIds = [...prevChatbotIds].filter(id => !newChatbotIds.has(id));
+
+      if (removedChatbotIds.length > 0) {
+        const { default: Contact } = await import('../models/contact.model.js');
+        await Contact.updateMany(
+          {
+            created_by: userId,
+            assigned_chatbot: { $in: removedChatbotIds },
+            deleted_at: null
+          },
+          { $set: { assigned_chatbot: null, chatbot_paused: false } }
+        );
+        console.log(`[updateAutomationFlow] Unassigned removed chatbot(s) [${removedChatbotIds.join(', ')}] from contacts after flow edit.`);
+      }
+    }
+
     if (name !== undefined) flow.name = name;
     if (description !== undefined) flow.description = description;
     if (nodes !== undefined) flow.nodes = nodes;
@@ -379,6 +410,70 @@ export const togglePauseAutomationFlow = async (req, res) => {
 
     flow.is_paused = is_paused;
     await flow.save();
+
+     if (flow.nodes && Array.isArray(flow.nodes)) {
+      const chatbotIds = flow.nodes
+        .filter(node => node.type === 'assign_chatbot' && node.parameters && node.parameters.chatbot_id)
+        .map(node => node.parameters.chatbot_id);
+
+      if (chatbotIds.length > 0) {
+        const { default: Chatbot } = await import('../models/chatbot.model.js');
+        await Chatbot.updateMany(
+          { _id: { $in: chatbotIds }, user_id: userId },
+          { $set: { status: is_paused ? 'inactive' : 'active' } }
+        );
+
+      if (is_paused) {
+          const { default: Contact } = await import('../models/contact.model.js');
+          await Contact.updateMany(
+            {
+              created_by: userId,
+              assigned_chatbot: { $in: chatbotIds },
+              deleted_at: null
+            },
+            { $set: { assigned_chatbot: null, chatbot_paused: false } }
+          );
+          console.log(`[togglePauseAutomationFlow] Unassigned chatbot(s) [${chatbotIds.join(', ')}] from contacts because flow ${flowId} was paused.`);
+        }
+      }
+
+      const sequenceIds = flow.nodes
+        .filter(node => node.type === 'send_sequence' && node.parameters && node.parameters.sequence_id)
+        .map(node => node.parameters.sequence_id);
+
+      if (sequenceIds.length > 0) {
+        const { default: Sequence } = await import('../models/sequence.model.js');
+        await Sequence.updateMany(
+          { _id: { $in: sequenceIds }, user_id: userId },
+          { $set: { is_active: !is_paused } }
+        );
+      }
+
+      const appointmentIds = flow.nodes
+        .filter(node => node.type === 'appointment_flow' && node.parameters && node.parameters.appointment_config_id)
+        .map(node => node.parameters.appointment_config_id);
+
+      if (appointmentIds.length > 0) {
+        const { default: AppointmentConfig } = await import('../models/appointment-config.model.js');
+        await AppointmentConfig.updateMany(
+          { _id: { $in: appointmentIds }, user_id: userId },
+          { $set: { status: is_paused ? 'inactive' : 'active' } }
+        );
+      }
+
+      const formIds = flow.nodes
+        .filter(node => node.type === 'form_flow' && node.parameters && node.parameters.form_id)
+        .map(node => node.parameters.form_id);
+
+      if (formIds.length > 0) {
+        const { default: Form } = await import('../models/formBuilder.model.js');
+        await Form.updateMany(
+          { _id: { $in: formIds }, user_id: userId },
+          { $set: { is_active: !is_paused } }
+        );
+      }
+    }
+
     automationCache.invalidateFlowCache(flowId, userId);
 
     res.json({
@@ -398,12 +493,14 @@ export const testAutomationFlow = async (req, res) => {
     const userId = req.user.owner_id;
     const { flowId } = req.params;
 
-    const { test_data, unsaved_flow } = req.body;
+    const test_data = req.body.test_data || {};
+    const { unsaved_flow } = req.body;
     test_data.userId = userId;
 
-    const senderNumber = 'test_simulator';
+    const sessionId = test_data.test_session_id || userId;
+    const senderNumber = `test_simulator_${sessionId}`;
 
-    if (test_data && test_data.reset) {
+    if (test_data.reset) {
       await AutomationExecution.updateMany(
         { contact_identifier: senderNumber, user_id: userId, status: 'waiting' },
         { $set: { status: 'failed', error: 'Test execution reset by user' } }
@@ -421,7 +518,7 @@ export const testAutomationFlow = async (req, res) => {
 
     if (unsaved_flow) {
       if (flowId === 'new' || flowId === 'draft' || !mongoose.Types.ObjectId.isValid(flowId)) {
-        tempFlowId = new mongoose.Types.ObjectId();
+        tempFlowId = mongoose.Types.ObjectId.isValid(sessionId) ? sessionId : new mongoose.Types.ObjectId();
         isTempFlow = true;
       }
       flow = {
@@ -458,7 +555,7 @@ export const testAutomationFlow = async (req, res) => {
       user_id: userId
     };
 
-    if (!isTempFlow && mongoose.Types.ObjectId.isValid(tempFlowId)) {
+    if (mongoose.Types.ObjectId.isValid(tempFlowId)) {
       waitingQuery.flow_id = tempFlowId;
     }
 
@@ -471,7 +568,7 @@ export const testAutomationFlow = async (req, res) => {
 
       const updatedExecution = await AutomationExecution.findById(waitingExecution._id);
 
-      const cleanExecutionLog = (updatedExecution.execution_log || []).map(log => ({
+      const cleanExecutionLog = (result.executionLog || updatedExecution.execution_log || []).map(log => ({
         node_id: log.node_id,
         node_type: log.node_type,
         status: log.status,
@@ -484,8 +581,8 @@ export const testAutomationFlow = async (req, res) => {
         success: true,
         data: {
           triggered: true,
-          success: true,
-          output: updatedExecution.output_data,
+          success: updatedExecution.status !== 'failed',
+          output: result.output || updatedExecution.input_data,
           executionLog: cleanExecutionLog,
           status: updatedExecution.status
         }
@@ -494,7 +591,7 @@ export const testAutomationFlow = async (req, res) => {
 
     const shouldExecute = automationEngine.checkMessageTriggerConditions(flow, message, senderNumber, recipientNumber, messageType, null, { interactive_id }, messagePayload);
 
-    if (!shouldExecute) {
+    if (!shouldExecute.match) {
       return res.json({
         success: true,
         message: 'Flow trigger conditions not met by this message.',
@@ -511,7 +608,7 @@ export const testAutomationFlow = async (req, res) => {
       message,
       interactive_id,
       messagePayload,
-      event_type: 'test',
+      event_type: 'message_received',
       timestamp: new Date()
     });
 
@@ -1388,6 +1485,18 @@ export const getAvailableNodeTypes = async (req, res) => {
         parameters: [
           { name: 'sequence_id', type: 'text', label: 'Sequence ID', required: true }
         ]
+      },
+      {
+        id: 'run_sub_flow',
+        name: 'Run Sub Flow',
+        description: 'Execute another published automation flow',
+        category: 'action',
+        icon: 'flow',
+        inputs: 1,
+        outputs: 1,
+        parameters: [
+          { name: 'sub_flow_id', type: 'text', label: 'Sub Flow ID', required: true }
+        ]
       }
     ];
 
@@ -1482,25 +1591,42 @@ Return the flow in the following JSON format ONLY:
         "value": ["sale", "help"]
       }
     }
-  ],
+  ],                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
   "nodes": [
     {
       "id": "trigger_1",
       "type": "trigger",
-      "position": { "x": 100, "y": 100 },
-      "parameters": { "nodeType": "trigger", "label": "Automation Root", "activationMethod": "partial_match", "activationPhrases": ["sale", "help"] }
+      "position": { "x": 100, "y": 300 },
+      "parameters": {
+        "nodeType": "trigger",
+        "label": "Incoming Message",
+        "triggerType": "contains keyword",                                                                                                                                                                                                                                                                                                                                                                                                                                                          
+        "keywords": ["sale", "help"],
+        "contactType": "Contact"
+      }
     },
     {
       "id": "cond_1",
       "type": "condition",
-      "position": { "x": 400, "y": 100 },
-      "parameters": { "nodeType": "condition", "label": "Logic Control", "conditions": [ { "field": "message_body", "operator": "contains_any", "value": ["sale", "help"], "sourceHandle": "branch_1" } ], "no_match_handle": "no_match" }
+      "position": { "x": 400, "y": 300 },
+      "parameters": {
+        "nodeType": "condition",
+        "label": "Logic Control",
+        "conditions": [
+          { "id": "branch_1", "field": "message.body", "operator": "contains_any", "value": ["sale", "help"], "sourceHandle": "branch_1" }
+        ],
+        "no_match_handle": "no_match"
+      }
     },
     {
       "id": "node_1",
       "type": "send_message",
-      "position": { "x": 700, "y": 100 },
-      "parameters": { "nodeType": "text_message", "label": "Send Message", "message": "Hello! How can we help you today?" }
+      "position": { "x": 700, "y": 300 },
+      "parameters": {
+        "nodeType": "text_message",
+        "label": "Send Message",
+        "message": "Hello! How can we help you today?"
+      }
     }
   ],
   "connections": [
@@ -1524,29 +1650,56 @@ Return the flow in the following JSON format ONLY:
 STRICT RULES:
 1. You MUST generate EXACTLY ONE node with type "trigger". IT MUST BE THE SINGLE ENTRY POINT OF THE FLOW.
 2. The entire flow MUST be a single cohesive tree connected by the "connections" array starting from "trigger_1". DO NOT create disconnected fragments or multiple triggers.
-3. Every edge in "connections" MUST include "sourceHandle" (e.g. "src" or a condition branch) and "targetHandle" (e.g. "tgt").
-4. EVERY SINGLE NODE (except the trigger) MUST be the target of at least one connection. THERE CAN BE NO ORPHANED OR DISCONNECTED NODES.
-5. You MUST use the correct "parameters" object for each node "type" and INCLUDE "nodeType" inside "parameters":
-  - "trigger": { "nodeType": "trigger", "label": "Automation Root", "activationMethod": "partial_match", "activationPhrases": ["word1", "word2"] } (activationMethod must be exact_match, partial_match, starts_with, or all_messages)
-  - "send_message": { "nodeType": "text_message", "label": "Send Message", "message": "Text here" }
-  - "button_message": { "nodeType": "button_message", "label": "Quick Reply", "message": "Text here", "buttons": [{ "text": "btn1", "value": "btn1" }] }
-  - "list_message": { "nodeType": "list_message", "label": "Selection List", "message": "Text here", "list_params": { "buttonTitle": "View Menu", "sections": [{"title": "Options", "items": [{"title": "opt1"}, {"title": "opt2"}]}] } }
-  - "send_template": { "nodeType": "send_template", "label": "Send Template", "template_name": "name_of_template", "language_code": "en_US" }
-  - "condition": { "nodeType": "condition", "label": "Logic Control", "conditions": [ { "field": "message_body", "operator": "equals"|"contains_any", "value": ["val1"], "sourceHandle": "branch_1" } ], "no_match_handle": "no_match" } (field must be message_body, sender_phone, or sender_name)
-  - "wait_for_reply": { "nodeType": "wait_for_reply", "label": "Wait For Reply", "variable_name": "last_user_message", "timeout_hours": 24 }
-  - "ask_and_wait": { "nodeType": "ask_and_wait", "label": "Ask & Wait", "message_body": "Question?", "expected_answers": [{"value": "Yes", "route": "route_1"}], "fallback_route": "fallback", "timeout_minutes": 10 }
-  - "send_sequence": { "nodeType": "send_sequence", "label": "Send Sequence", "sequence_id": "string" }
-  - "add_tag": { "nodeType": "add_tag", "label": "Assign Tag", "tag_name": "string" }
-  - "remove_tag": { "nodeType": "remove_tag", "label": "Remove Tag", "tag_ids": ["string"] }
-  - "delay": { "nodeType": "delay", "label": "Wait Timer", "delay_ms": 1000 }
-  - "cta_button": { "nodeType": "cta_button", "label": "Call To Action", "message": "Text", "button_text": "Click Here", "url": "https://..." }
-  - "assign_agent": { "nodeType": "assign_agent", "label": "Assign Agent", "agent_id": "string" }
-  - "save_to_google_sheet": { "nodeType": "save_to_google_sheet", "label": "Save to Google Sheet", "spreadsheet_id": "optional", "worksheet_id": "optional", "mappings": [{"column": "A", "variable": "name"}] }
-  - "create_calendar_event": { "nodeType": "create_calendar_event", "label": "Create Calendar Event", "event_title": "Reservation", "start_time": "{{reservation_date}} {{reservation_time}}" }${platformRules}
-6. Generate all customer-facing text in ${language} language with a ${tone} tone.
-7. Position coordinates (x, y) must space nodes out properly (e.g. increase x by 300 for each step).
-8. If you cannot comply exactly, return an empty JSON object {}.
-9. Return ONLY the raw JSON object - NO markdown backticks, NO explanations, NO additional text.
+3. Every edge in "connections" MUST include "sourceHandle" and "targetHandle" (normally "src" and "tgt").
+4. Interactive Branching Rules:
+   - For edges originating from a "button_message" node, "sourceHandle" MUST be "src-btn-0" for the first button, "src-btn-1" for the second, etc.
+   - For edges originating from a "list_message" node, "sourceHandle" MUST be "src-item-0" for the first item, "src-item-1" for the second, etc.
+   - For edges originating from a "condition" node, "sourceHandle" MUST match the "sourceHandle" of the matching condition object (e.g., "branch_1"), or "no_match" for unmatched.
+   - For edges originating from an "advanced_condition" node, "sourceHandle" MUST be "if-true" or "if-false".
+   - For edges originating from an "ask_and_wait" node, "sourceHandle" MUST be the route value of the expected answer (e.g., "route_1"), or "fallback" for unmatched.
+5. EVERY SINGLE NODE (except the trigger) MUST be the target of at least one connection. THERE CAN BE NO ORPHANED OR DISCONNECTED NODES.
+6. Node Schema Mapping:
+   Each node in the "nodes" array MUST have one of the following exact "type" properties, with the corresponding "nodeType" inside "parameters":
+   - "trigger": parameters = { "nodeType": "trigger", "label": "Incoming Message", "triggerType": "contains keyword"|"on exact match"|"starts with"|"any message"|"order received", "keywords": ["kw1"], "contactType": "Contact" }
+   - "send_message" (used for text, button, list, media, or location messages):
+     - nodeType = "text_message": parameters = { "nodeType": "text_message", "label": "Send Message", "message": "Text content" }
+     - nodeType = "button_message": parameters = { "nodeType": "button_message", "label": "Quick Reply", "message": "Body text", "buttons": [{"text": "Btn Text", "value": "btn_1"}] } (max 3 buttons)
+     - nodeType = "list_message": parameters = { "nodeType": "list_message", "label": "Selection List", "bodyText": "Body text", "headerText": "Header", "footerText": "Footer", "buttonText": "View Menu", "sections": [{"title": "Category", "items": [{"title": "Option 1", "description": "Desc"}]}] }
+     - nodeType = "media_message": parameters = { "nodeType": "media_message", "label": "Send Media", "mediaType": "image"|"video"|"document"|"audio", "mediaUrl": "https://...", "caption": "Caption text" }
+     - nodeType = "location": parameters = { "nodeType": "location", "label": "Send Location", "lat": 12.9716, "lng": 77.5946, "name": "Name", "address": "Address" }
+   - "condition": parameters = { "nodeType": "condition", "label": "Logic Control", "conditions": [{"id": "branch_1", "field": "message.body"|"sender.phone"|"sender.name", "operator": "contains"|"contains_any"|"equals"|"equals_any"|"starts_with"|"ends_with"|"exists", "value": ["val"], "sourceHandle": "branch_1"}], "no_match_handle": "no_match" }
+   - "advanced_condition": parameters = { "nodeType": "advanced_condition", "label": "Advanced Condition", "match_type": "AND"|"OR", "rules": [{"field": "message.body"|"sender.phone"|"sender.name", "operator": "contains"|"contains_any"|"equals"|"equals_any"|"starts_with"|"ends_with"|"exists", "value": "val"}] }
+   - "wait_for_reply": parameters = { "nodeType": "wait_for_reply", "label": "Wait For Reply", "variable_name": "variable_to_store" }
+   - "ask_and_wait": parameters = { "nodeType": "ask_and_wait", "label": "Ask & Wait", "message_body": "Question?", "expected_answers": [{"value": "Yes", "route": "route_1"}], "fallback_route": "fallback", "timeout_minutes": 10 }
+   - "send_template": parameters = { "nodeType": "send_template", "label": "Send Template", "template_name": "name", "language_code": "en_US", "body_variables": {"1": "var1"} }
+   - "cta_button": parameters = { "nodeType": "cta_button", "label": "Call To Action", "message": "Text", "button_text": "Click Here", "url": "https://..." }
+   - "assign_chatbot": parameters = { "nodeType": "assign_chatbot", "label": "Assign Chatbot", "chatbot_id": "id" }
+   - "save_to_google_sheet": parameters = { "nodeType": "save_to_google_sheet", "label": "Save to Google Sheet", "spreadsheet_id": "id", "worksheet_id": "id", "mappings": [{"column": "A", "variable": "name"}] }
+   - "send_google_form": parameters = { "nodeType": "send_google_form", "label": "Send Google Form", "google_form_id": "id" }
+   - "create_calendar_event": parameters = { "nodeType": "create_calendar_event", "label": "Create Calendar Event", "event_title": "Reservation", "start_time": "{{reservation_date}} {{reservation_time}}" }
+   - "create_google_meet": parameters = { "nodeType": "create_google_meet", "label": "Create Google Meet", "meet_title": "Title" }
+   - "add_tag": parameters = { "nodeType": "add_tag", "label": "Assign Tag", "tag_name": "tag" }
+   - "remove_tag": parameters = { "nodeType": "remove_tag", "label": "Remove Tag", "tag_ids": ["id"] }
+   - "webhook": parameters = { "nodeType": "webhook", "label": "Webhook", "url": "https://...", "method": "POST"|"GET", "headers": {}, "body": {} }
+   - "form_flow": parameters = { "nodeType": "form_flow", "label": "Form Flow", "form_id": "id", "message_body": "Body text", "button_text": "Open Form" }
+   - "add_to_segment": parameters = { "nodeType": "add_segment", "label": "Add to Segment", "segment_id": "id" }
+   - "update_contact": parameters = { "nodeType": "update_contact", "label": "Update Contact", "updates": [{"field_key": "name", "value": "value"}] }
+   - "assign_agent": parameters = { "nodeType": "assign_agent", "label": "Assign Agent", "agent_id": "id" }
+   - "assign_random_agent": parameters = { "nodeType": "assign_random_agent", "label": "Assign Random Agent", "agent_ids": ["id"] }
+   - "send_sequence": parameters = { "nodeType": "send_sequence", "label": "Send Sequence", "sequence_id": "id" }
+   - "run_sub_flow": parameters = { "nodeType": "run_sub_flow", "label": "Run Sub Flow", "sub_flow_id": "id" }
+   - "appointment_flow": parameters = { "nodeType": "appointment_flow", "label": "Appointment Flow", "appointment_type_id": "id" }
+   - "send_catalog": parameters = { "nodeType": "send_catalog", "label": "Send Catalog Product", "product_id": "id" }
+   - "send_shopify": parameters = { "nodeType": "send_shopify", "label": "Send Shopify Product", "product_id": "id" }
+   - "move_to_pipeline_stage": parameters = { "nodeType": "move_to_pipeline_stage", "label": "Move Pipeline Stage", "funnel_id": "id", "stage_id": "id" }
+   - "response_saver": parameters = { "nodeType": "response_saver", "label": "Save Response", "mappings": [{"source_path": "message", "variable_name": "var", "custom_field_key": "custom_field"}] }
+   - "delay": parameters = { "nodeType": "delay", "label": "Wait Timer", "delay_ms": 1000 }
+   - "api": parameters = { "nodeType": "api", "label": "External API", "url": "https://...", "method": "GET"|"POST", "headers": {}, "body": {}, "response_mapping": [{"response_path": "path", "variable_name": "var", "custom_field_key": "custom_field"}] }
+7. You MUST NOT use any other node types or properties that are not listed here.${platformRules}
+8. Generate all customer-facing text in ${language} language with a ${tone} tone.
+9. Position coordinates (x, y) must space nodes out properly (e.g. increase x by 300 for each step).
+10. If you cannot comply exactly, return an empty JSON object {}.
+11. Return ONLY the raw JSON object - NO markdown backticks, NO explanations, NO additional text.
 `;
 
     const aiResponse = await callAIModel(userId, aiModel, apiKey, prompt);

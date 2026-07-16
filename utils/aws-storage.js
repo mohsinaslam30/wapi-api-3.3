@@ -99,7 +99,6 @@ class AWSStorage {
           Key: key,
           Body: body,
           ContentType: file.mimetype || 'application/octet-stream',
-          // ACL: 'public-read',
         },
       });
 

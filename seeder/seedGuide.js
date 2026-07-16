@@ -3845,7 +3845,7 @@ Click on "Verify and Save" to complete the webhook setup and start receiving rea
             guideData.position = categoryPositions[guideData.category] || 999;
             await Guide.findOneAndUpdate(
                 { title: guideData.title, category: guideData.category },
-                guideData,
+                { $setOnInsert: guideData },
                 { upsert: true, returnDocument: 'after' }
             );
         }

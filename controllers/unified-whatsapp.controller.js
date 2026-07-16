@@ -4,7 +4,7 @@ import { uploadSingle } from '../utils/upload.js';
 import { Setting } from '../models/index.js';
 const WHATSAPP_JID_SUFFIX = '@s.whatsapp.net';
 import axios from 'axios';
-import { WhatsappConnection } from '../models/index.js';
+import { WhatsappConnection, EcommerceProduct } from '../models/index.js';
 import { assignChatToAgent as assignChatToAgentFromChat } from './chat.controller.js';
 import paymentLinkService from '../services/payment-link.service.js';
 import mongoose from 'mongoose';
@@ -283,7 +283,10 @@ export const sendMessage = async (req, res) => {
       coupon_code,
       carouselCardsData,
       carouselProducts,
-      template_id: templateIdInput
+      template_id: templateIdInput,
+      google_account_id,
+      meet_start_time,
+      meet_end_time
     } = req.body;
 
     const amount = rawAmount ? Math.round(Number(rawAmount) * 100) : undefined;
@@ -396,7 +399,7 @@ export const sendMessage = async (req, res) => {
               file: uploadedFile,
               messageType: messageTypeInput,
               interactiveType,
-              buttonParams,
+              buttonParams: buttonParams || buttons,
               listParams,
               templateName,
               languageCode,
@@ -438,6 +441,70 @@ export const sendMessage = async (req, res) => {
     let messageType = messageTypeInput || req.body.type || req.body.message_type || 'text';
     let whatsappPhoneNumberId = whatsappPhoneNumberIdInput;
     let contactId = contactIdInput;
+
+    if (messageType === 'google_meet') {
+      const { default: GoogleAccount } = await import('../models/google-account.model.js');
+      const { getCalendarClient } = await import('../utils/google-api-helper.js');
+      const { default: Contact } = await import('../models/contact.model.js');
+
+      let query = {
+        user_id: userId,
+        status: 'active',
+        deleted_at: null
+      };
+
+      if (google_account_id) {
+        query._id = google_account_id;
+      }
+
+      const googleAccount = await GoogleAccount.findOne(query);
+
+      if (!googleAccount) {
+        return res.status(400).json({ success: false, error: 'No active Google Account connected, or the specified account is invalid. Please connect your Google Account in settings.' });
+      }
+
+      try {
+        let contactName = 'Client';
+        if (contactId) {
+          const currentContact = await Contact.findById(contactId).select('name phone_number');
+          if (currentContact) contactName = currentContact.name || currentContact.phone_number || 'Client';
+        }
+
+        const calendarClient = await getCalendarClient(googleAccount._id);
+        const start = meet_start_time ? new Date(meet_start_time) : new Date();
+        const end = meet_end_time ? new Date(meet_end_time) : new Date(start.getTime() + 60 * 60 * 1000);
+
+        const event = await calendarClient.events.insert({
+          calendarId: 'primary',
+          conferenceDataVersion: 1,
+          requestBody: {
+            summary: `Meeting with ${contactName}`,
+            description: 'Automated Google Meet link generated from CRM.',
+            start: { dateTime: start.toISOString() },
+            end: { dateTime: end.toISOString() },
+            conferenceData: {
+              createRequest: {
+                requestId: `meet-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+                conferenceSolutionKey: { type: 'hangoutsMeet' }
+              }
+            }
+          }
+        });
+
+        const meetLink = event.data.hangoutLink || (event.data.conferenceData && event.data.conferenceData.entryPoints?.find(e => e.entryPointType === 'video')?.uri);
+
+        if (!meetLink) {
+          return res.status(500).json({ success: false, error: 'Failed to generate Google Meet link from calendar event.' });
+        }
+
+        messageText = `Here is your Google Meet link:\n${meetLink}`;
+        messageType = 'text';
+
+      } catch (err) {
+        console.error('[Google Meet API Error]:', err);
+        return res.status(500).json({ success: false, error: 'Failed to create Google Meet link.', details: err.message });
+      }
+    }
 
     if (platformInput && ['telegram', 'facebook', 'instagram', 'twitter'].includes(platformInput) && !contactId && !whatsappPhoneNumberId) {
       const platform = platformInput;
@@ -564,6 +631,13 @@ export const sendMessage = async (req, res) => {
         platform_message_id: platformMessageId ? platformMessageId.toString() : undefined
       });
 
+      if (contact) {
+        await Contact.updateOne(
+          { _id: contact._id },
+          { last_outgoing_message_at: new Date(), snooze_count: 0, is_snoozed: false }
+        );
+      }
+
       const io = req.app.get('io');
       if (io && contact) {
         const formattedMessage = {
@@ -605,6 +679,7 @@ export const sendMessage = async (req, res) => {
       const wNumber = await WhatsappPhoneNumber.findOne({
         $or: [
           { display_phone_number: whatsappPhoneNumberInput },
+          { display_phone_number: whatsappPhoneNumberInput.startsWith('+') ? whatsappPhoneNumberInput.slice(1) : `+${whatsappPhoneNumberInput}` },
           { phone_number_id: whatsappPhoneNumberInput }
         ],
         user_id: userId,
@@ -616,24 +691,56 @@ export const sendMessage = async (req, res) => {
     }
 
     if (!contactId && contactNoInput) {
-      const cleanedPhone = contactNoInput.replace(/[\s\-()\+]/g, '');
-      if (!/^\d{6,15}$/.test(cleanedPhone)) {
-        return res.status(400).json({
-          success: false,
-          error: 'Contact phone number must be 6-15 digits'
-        });
+      const isBsuid = /^[A-Z]{2}\.\d+$/.test(contactNoInput.trim());
+      const isPhone = !isBsuid && /^\+?\d+$/.test(contactNoInput.replace(/[\s\-()]/g, ''));
+      let cleanedPhone = null;
+      let usernameInput = null;
+      let bsuidInput = null;
+
+      if (isBsuid) {
+        bsuidInput = contactNoInput.trim();
+      } else if (isPhone) {
+        cleanedPhone = contactNoInput.replace(/[\s\-()\+]/g, '');
+        if (!/^\d{6,15}$/.test(cleanedPhone)) {
+          return res.status(400).json({
+            success: false,
+            error: 'Contact phone number must be 6-15 digits'
+          });
+        }
+      } else {
+        usernameInput = contactNoInput.trim();
+        if (!/^[a-zA-Z0-9_.-]{3,30}$/.test(usernameInput)) {
+          return res.status(400).json({
+            success: false,
+            error: 'Invalid WhatsApp username format'
+          });
+        }
       }
 
+      const query = { user_id: userId };
+      if (cleanedPhone) {
+        query.phone_number = cleanedPhone;
+      } else if (bsuidInput) {
+        query.whatsapp_bsuid = bsuidInput;
+      } else {
+        query.whatsapp_username = usernameInput;
+      }
+
+      const setOnInsert = {
+        name: contactNoInput,
+        user_id: userId,
+        created_by: userId,
+        status: 'lead',
+        source: 'whatsapp'
+      };
+      if (cleanedPhone) setOnInsert.phone_number = cleanedPhone;
+      if (bsuidInput) setOnInsert.whatsapp_bsuid = bsuidInput;
+      if (usernameInput) setOnInsert.whatsapp_username = usernameInput;
+
       let contact = await Contact.findOneAndUpdate(
-        { phone_number: cleanedPhone, user_id: userId },
+        query,
         {
-          $setOnInsert: {
-            phone_number: cleanedPhone,
-            name: contactNoInput,
-            user_id: userId,
-            created_by: userId,
-            status: 'lead'
-          },
+          $setOnInsert: setOnInsert,
           $set: { deleted_at: null }
         },
         { new: true, upsert: true }
@@ -688,25 +795,25 @@ export const sendMessage = async (req, res) => {
             amount,
             currency: currency || 'INR',
             description: description || 'Payment for service',
-            whatsapp_phone_number_id: whatsappPhoneNumberIdInput, 
+            whatsapp_phone_number_id: whatsappPhoneNumberIdInput,
             gateway_config_id: gateway_id,
-            skip_message: true, 
+            skip_message: true,
             metadata: {
               description: description || 'Payment for service',
               contact_id: contactDoc._id
             }
           });
-          
+
           const amountDisplay = (amount / 100).toFixed(2);
-          messageText = 
+          messageText =
             `💳 *Payment Required*\n\n` +
             `*Description:* ${description || 'Payment for service'}\n` +
             `*Amount:* ${currency || 'INR'} ${amountDisplay}\n\n` +
             `Please complete your payment using the link below:\n` +
             `${paymentResult.payment_link}\n\n` +
             `_This link is secure and unique to you._`;
-            
-          msgType = 'text'; 
+
+          msgType = 'text';
         }
 
         let workspaceId = contactDoc.workspace_id;
@@ -841,11 +948,11 @@ export const sendMessage = async (req, res) => {
               try {
                 const { saveBufferLocally, convertAudioForMeta } = await import('../utils/whatsapp-message-handler.js');
                 let localPath = await saveBufferLocally(fileObj.buffer, fileObj.mimetype, currentMsgType, userId);
-                
+
                 if (currentMsgType === 'audio' && ['facebook', 'instagram'].includes(platform)) {
                   localPath = await convertAudioForMeta(localPath);
                 }
-                
+
                 fileUrlToPass = localPath;
                 dbFileUrl = localPath;
               } catch (saveErr) {
@@ -867,14 +974,12 @@ export const sendMessage = async (req, res) => {
             dbFileUrl = mediaItem.file;
           }
 
-          if (dbFileUrl && typeof dbFileUrl === 'string' && dbFileUrl.startsWith('http')) {
-            try {
-              const urlObj = new URL(dbFileUrl);
-              dbFileUrl = urlObj.pathname.replace(/^\//, '');
-            } catch (_) { }
-          }
 
-          let buttonsToPass = buttonParams || buttons;
+
+          let buttonsToPass = buttons || buttonParams;
+          if (buttonsToPass && !Array.isArray(buttonsToPass)) {
+            buttonsToPass = [buttonsToPass];
+          }
           let messageTextToPass = messageText;
 
           if (mediaItems.length > 1) {
@@ -957,7 +1062,7 @@ export const sendMessage = async (req, res) => {
           const interactiveDataToSave = currentMsgType === 'interactive'
             ? {
               interactiveType,
-              buttons: interactiveType === 'button' ? buttonParams : undefined,
+              buttons: (interactiveType === 'button' || interactiveType === 'cta_url') ? (buttonParams || buttons) : undefined,
               list: interactiveType === 'list' ? listParams : undefined
             }
             : null;
@@ -992,6 +1097,11 @@ export const sendMessage = async (req, res) => {
           });
 
           lastMessage = newMessage;
+
+          contactDoc.last_outgoing_message_at = new Date();
+          contactDoc.snooze_count = 0;
+          contactDoc.is_snoozed = false;
+          await contactDoc.save();
 
           const io = req.app.get('io');
           if (io) {
@@ -1043,21 +1153,39 @@ export const sendMessage = async (req, res) => {
         });
       } catch (err) {
         console.error(`Error sending ${contactDoc.source} message:`, err);
-        let errorMessage = 'Failed to send omnichannel message';
-        if (err.message) {
-          errorMessage = err.message;
+        let errorMessage = err.message || 'Failed to send omnichannel message';
+
+        if (err.response?.data?.error) {
+          const metaError = err.response.data.error;
+          errorMessage = metaError.error_user_msg || metaError.message || errorMessage;
+        } else if (err.response?.data?.message) {
+          errorMessage = err.response.data.message;
         } else if (err.error && err.error.description) {
           errorMessage = err.error.description;
-        } else if (typeof err === 'object') {
-          errorMessage = JSON.stringify(err);
         }
-        return res.status(500).json({ success: false, error: errorMessage });
+
+        return res.status(500).json({ success: false, error: errorMessage, details: errorMessage });
       }
     }
 
     if (!whatsappPhoneNumberId && connectionId && provider === PROVIDER_TYPES.BAILEY) {
       const phone = await WhatsappPhoneNumber.findOne({ waba_id: connectionId, deleted_at: null }).lean();
       if (phone) whatsappPhoneNumberId = phone._id.toString();
+    }
+
+    if (whatsappPhoneNumberId) {
+      const phone = await WhatsappPhoneNumber.findById(whatsappPhoneNumberId).lean();
+      if (!phone) {
+        const phoneByWaba = await WhatsappPhoneNumber.findOne({ waba_id: whatsappPhoneNumberId, deleted_at: null }).lean();
+        if (phoneByWaba) {
+          whatsappPhoneNumberId = phoneByWaba._id.toString();
+        } else {
+          return res.status(400).json({
+            success: false,
+            error: `Invalid whatsapp_phone_number_id provided (${whatsappPhoneNumberId}). This ID does not match any registered WhatsApp phone number or connection.`
+          });
+        }
+      }
     }
 
     if (!contactId || !whatsappPhoneNumberId) {
@@ -1135,7 +1263,7 @@ export const sendMessage = async (req, res) => {
       file: uploadedFile,
       messageType,
       interactiveType,
-      buttonParams,
+      buttonParams: buttonParams || buttons,
       listParams,
       templateName,
       languageCode,
@@ -1210,10 +1338,17 @@ export const sendMessage = async (req, res) => {
     });
   } catch (error) {
     console.error('Error sending message:', error);
+    let errorDetails = error.message;
+    if (error.response?.data?.error) {
+      const metaError = error.response.data.error;
+      errorDetails = metaError.error_user_msg || metaError.message || errorDetails;
+    } else if (error.response?.data?.message) {
+      errorDetails = error.response.data.message;
+    }
     return res.status(500).json({
       success: false,
-      error: 'Failed to send message',
-      details: error.message
+      error: errorDetails || 'Failed to send message',
+      details: errorDetails
     });
   }
 };
@@ -1236,7 +1371,9 @@ export const getContactProfile = async (req, res) => {
       });
     }
 
-    const contact = await Contact.findById(contactId).populate('assigned_call_agent_id', 'name');
+    const contact = await Contact.findById(contactId)
+      .populate('assigned_call_agent_id', 'name')
+      .populate('assigned_chatbot', 'name');
     if (!contact) {
       return res.status(404).json({
         success: false,
@@ -1479,6 +1616,8 @@ export const getContactProfile = async (req, res) => {
         _id: contact._id.toString(),
         name: contact.name,
         phone_number: displayName,
+        whatsapp_username: contact.whatsapp_username || null,
+        whatsapp_bsuid: contact.whatsapp_bsuid || null,
         email: contact.email,
         status: contact.status,
         chat_status: contact.chat_status,
@@ -1493,7 +1632,8 @@ export const getContactProfile = async (req, res) => {
       })),
       media: mediaByWeeks,
       assigned_agent: assignedAgentId,
-      assigned_call_agent: contact.assigned_call_agent_id
+      assigned_call_agent: contact.assigned_call_agent_id,
+      assigned_chatbot: contact.assigned_chatbot
     });
   } catch (error) {
     console.error('Error retrieving contact profile:', error);
@@ -1693,7 +1833,7 @@ export const getMessages = async (req, res) => {
     if (contact.source && ['telegram', 'facebook', 'instagram'].includes(contact.source)) {
       let activeConnection = null;
       const connectionIdToUse = connection_id && connection_id !== 'null' && connection_id !== 'undefined' ? connection_id : whatsappPhoneNumberId;
-      
+
       if (connectionIdToUse && connectionIdToUse !== 'null' && connectionIdToUse !== 'undefined') {
         const isObjectId = mongoose.Types.ObjectId.isValid(connectionIdToUse);
         if (contact.source === 'telegram') {
@@ -1721,7 +1861,7 @@ export const getMessages = async (req, res) => {
           });
         }
       }
-      
+
       if (!activeConnection) {
         if (contact.source === 'telegram') {
           activeConnection = await TelegramConnection.findOne({ user_id: userId, is_active: true });
@@ -1764,7 +1904,7 @@ export const getMessages = async (req, res) => {
             platformIds.push(...activeConnection.pages.map(p => p.instagram_account_id).filter(Boolean));
           }
         }
-        
+
         if (platformIds.length > 0) {
           query.$or = [{ sender_id: { $in: platformIds } }, { recipient_id: { $in: platformIds } }];
         }
@@ -2097,6 +2237,160 @@ export const togglePinChat = async (req, res) => {
   }
 };
 
+
+export const assignChatbot = async (req, res) => {
+  try {
+    const userId = req.user.owner_id;
+    const { contact_id, chatbot_id, chatbot_paused } = req.body;
+
+    if (!contact_id) {
+      return res.status(400).json({ success: false, error: 'contact_id is required' });
+    }
+
+    const contact = await Contact.findOne({
+      _id: contact_id,
+      created_by: userId,
+      deleted_at: null
+    });
+
+    if (!contact) {
+      return res.status(404).json({ success: false, error: 'Contact not found' });
+    }
+
+    if (chatbot_id !== undefined) {
+      contact.assigned_chatbot = chatbot_id || null;
+      if (chatbot_id) {
+        contact.chatbot_paused = false;
+        contact.ai_message_count = 0;
+      }
+    }
+
+    if (chatbot_paused !== undefined) {
+      contact.chatbot_paused = chatbot_paused;
+      if (chatbot_paused === false) {
+        contact.ai_message_count = 0;
+      }
+    }
+
+    await contact.save();
+
+    return res.status(200).json({
+      success: true,
+      message: 'AI Agent assignment updated successfully',
+      data: {
+        contact_id: contact._id,
+        assigned_chatbot: contact.assigned_chatbot,
+        chatbot_paused: contact.chatbot_paused
+      }
+    });
+
+  } catch (error) {
+    console.error('Error assigning chatbot:', error);
+    return res.status(500).json({ success: false, error: 'Failed to assign AI Agent', details: error.message });
+  }
+};
+
+export const unassignChatbot = async (req, res) => {
+  try {
+    const userId = req.user.owner_id;
+    const { contact_id } = req.body;
+
+    if (!contact_id) {
+      return res.status(400).json({ success: false, error: 'contact_id is required' });
+    }
+
+    const contact = await Contact.findOne({
+      _id: contact_id,
+      created_by: userId,
+      deleted_at: null
+    });
+
+    if (!contact) {
+      return res.status(404).json({ success: false, error: 'Contact not found' });
+    }
+
+    contact.assigned_chatbot = null;
+    contact.chatbot_paused = false;
+    contact.ai_message_count = 0;
+
+    await contact.save();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Chatbot unassigned successfully',
+      contact
+    });
+
+  } catch (error) {
+    console.error('Error in unassignChatbot:', error);
+    return res.status(500).json({ success: false, error: 'Failed to unassign chatbot', details: error.message });
+  }
+};
+
+export const toggleSnooze = async (req, res) => {
+  try {
+    const userId = req.user.owner_id;
+    const { contact_id: contactId, phone_number: phoneNumber, is_snoozed, snooze_time_minutes, snooze_count_limit } = req.body;
+
+    if (!contactId && !phoneNumber) {
+      return res.status(400).json({
+        success: false,
+        error: 'contact_id or phone_number is required'
+      });
+    }
+
+    let contact = null;
+
+    if (contactId) {
+      contact = await Contact.findById(contactId);
+    } else if (phoneNumber) {
+      contact = await Contact.findOne({
+        phone_number: phoneNumber,
+        created_by: userId,
+        deleted_at: null
+      });
+    }
+
+    if (!contact || contact.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        error: 'Contact not found'
+      });
+    }
+
+    if (is_snoozed !== undefined) {
+      contact.is_snoozed = is_snoozed;
+    } else {
+      contact.is_snoozed = !contact.is_snoozed;
+    }
+
+    if (snooze_time_minutes !== undefined) contact.snooze_time_minutes = snooze_time_minutes;
+    if (snooze_count_limit !== undefined) contact.snooze_count_limit = snooze_count_limit;
+
+    if (!contact.is_snoozed) {
+      contact.snooze_count = 0;
+    }
+    await contact.save();
+
+    return res.json({
+      success: true,
+      data: {
+        id: contact._id.toString(),
+        is_snoozed: contact.is_snoozed,
+        snooze_time_minutes: contact.snooze_time_minutes,
+        snooze_count_limit: contact.snooze_count_limit
+      }
+    });
+  } catch (error) {
+    console.error('Error toggling snooze:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to toggle snooze',
+      details: error.message
+    });
+  }
+};
+
 const parseRecentChatsDate = (dateStr) => {
   if (!dateStr) return null;
   const d = new Date(dateStr);
@@ -2380,6 +2674,7 @@ export const getRecentChats = async (req, res) => {
           name: contact.name,
           chat_status: contact.chat_status || 'open',
           is_pinned: contact.is_pinned === true,
+          is_snoozed: contact.is_snoozed === true,
           tags: contact.tags || []
         };
       });
@@ -2449,14 +2744,17 @@ export const getRecentChats = async (req, res) => {
         const contactId = chat.contact.id;
         const contactInfo = contactMap[contactId] || {
           is_pinned: false,
+          is_snoozed: false,
           chat_status: 'open'
         };
         return {
           ...chat,
           is_pinned: chat.is_pinned || contactInfo.is_pinned,
+          is_snoozed: contactInfo.is_snoozed,
           contact: {
             ...chat.contact,
             is_pinned: chat.is_pinned || contactInfo.is_pinned,
+            is_snoozed: contactInfo.is_snoozed,
             chat_status: contactInfo.chat_status,
             labels: mergeLabelDetails(contactId)
           }
@@ -2734,7 +3032,7 @@ export const getRecentChats = async (req, res) => {
       created_by: contactsOwnerId,
       deleted_at: null
     })
-      .select('_id phone_number name tags is_pinned chat_status')
+      .select('_id phone_number name tags is_pinned is_snoozed chat_status')
       .populate('tags', 'label color')
       .lean();
 
@@ -2743,7 +3041,8 @@ export const getRecentChats = async (req, res) => {
         id: contact._id.toString(),
         name: contact.name,
         chat_status: contact.chat_status || 'open',
-        is_pinned: contact.is_pinned === true
+        is_pinned: contact.is_pinned === true,
+        is_snoozed: contact.is_snoozed === true
       };
       return acc;
     }, {});
@@ -2835,10 +3134,12 @@ export const getRecentChats = async (req, res) => {
         const contactInfo = contactMap[chat.contact.number] || {
           id: null,
           name: chat.contact.number,
-          is_pinned: false
+          is_pinned: false,
+          is_snoozed: false
         };
 
         const isPinned = !!contactInfo.is_pinned;
+        const isSnoozed = !!contactInfo.is_snoozed;
         const contactId = contactInfo.id;
 
         let displayName = chat.contact.number;
@@ -2849,12 +3150,14 @@ export const getRecentChats = async (req, res) => {
         return {
           ...chat,
           is_pinned: isPinned,
+          is_snoozed: isSnoozed,
           contact: {
             ...chat.contact,
             id: contactId,
             number: displayName,
             name: contactInfo.name,
             is_pinned: isPinned,
+            is_snoozed: isSnoozed,
             chat_status: contactInfo.chat_status || 'open',
             labels: mergeLabelDetails(contactId)
           }
@@ -2865,10 +3168,12 @@ export const getRecentChats = async (req, res) => {
         const contactInfo = contactMap[chat.contact.number] || {
           id: null,
           name: chat.contact.number,
-          is_pinned: false
+          is_pinned: false,
+          is_snoozed: false
         };
 
         const isPinned = !!contactInfo.is_pinned;
+        const isSnoozed = !!contactInfo.is_snoozed;
         const contactId = contactInfo.id;
 
         let displayName = chat.contact.number;
@@ -2879,12 +3184,14 @@ export const getRecentChats = async (req, res) => {
         return {
           ...chat,
           is_pinned: isPinned,
+          is_snoozed: isSnoozed,
           contact: {
             ...chat.contact,
             id: contactId,
             number: displayName,
             name: contactInfo.name,
             is_pinned: isPinned,
+            is_snoozed: isSnoozed,
             chat_status: contactInfo.chat_status || 'open',
             labels: mergeLabelDetails(contactId)
           }
@@ -3178,13 +3485,41 @@ export const connectWhatsApp = async (req, res) => {
 
       let phoneNumber = await WhatsappPhoneNumber.findOne({
         phone_number_id
+      }).populate('waba_id');
+
+      if (phoneNumber && phoneNumber.deleted_at === null) {
+        if (phoneNumber.user_id.toString() !== userId.toString()) {
+          return res.status(400).json({
+            success: false,
+            error: 'This WhatsApp phone number is already connected to another user.'
+          });
+        }
+        if (workspace_id && phoneNumber.waba_id && phoneNumber.waba_id.workspace_id && phoneNumber.waba_id.workspace_id.toString() !== workspace_id.toString()) {
+          return res.status(400).json({
+            success: false,
+            error: 'This WhatsApp phone number is already connected to another workspace.'
+          });
+        }
+      }
+
+      let wabaCheck = await WhatsappWaba.findOne({
+        whatsapp_business_account_id,
+        deleted_at: null
       });
 
-      if (phoneNumber && phoneNumber.user_id.toString() !== userId.toString() && phoneNumber.deleted_at === null) {
-        return res.status(400).json({
-          success: false,
-          error: 'This WhatsApp phone number is already connected to another workspace or user.'
-        });
+      if (wabaCheck) {
+        if (wabaCheck.user_id.toString() !== userId.toString()) {
+          return res.status(400).json({
+            success: false,
+            error: 'This WhatsApp Business Account is already connected to another user.'
+          });
+        }
+        if (workspace_id && wabaCheck.workspace_id && wabaCheck.workspace_id.toString() !== workspace_id.toString()) {
+          return res.status(400).json({
+            success: false,
+            error: 'This WhatsApp Business Account is already connected to another workspace.'
+          });
+        }
       }
 
       if (workspace_id) {
@@ -3386,13 +3721,41 @@ export const getEmbbededSignupConnection = async (req, res) => {
 
     let phoneNumber = await WhatsappPhoneNumber.findOne({
       phone_number_id: signupData.phone_number_id
+    }).populate('waba_id');
+
+    if (phoneNumber && phoneNumber.deleted_at === null) {
+      if (phoneNumber.user_id.toString() !== userId.toString()) {
+        return res.status(400).json({
+          success: false,
+          error: 'This WhatsApp phone number is already connected to another user.'
+        });
+      }
+      if (workspace_id && phoneNumber.waba_id && phoneNumber.waba_id.workspace_id && phoneNumber.waba_id.workspace_id.toString() !== workspace_id.toString()) {
+        return res.status(400).json({
+          success: false,
+          error: 'This WhatsApp phone number is already connected to another workspace.'
+        });
+      }
+    }
+
+    let wabaCheck = await WhatsappWaba.findOne({
+      whatsapp_business_account_id: signupData.waba_id,
+      deleted_at: null
     });
 
-    if (phoneNumber && phoneNumber.user_id.toString() !== userId.toString() && phoneNumber.deleted_at === null) {
-      return res.status(400).json({
-        success: false,
-        error: 'This WhatsApp phone number is already connected to another workspace or user.'
-      });
+    if (wabaCheck) {
+      if (wabaCheck.user_id.toString() !== userId.toString()) {
+        return res.status(400).json({
+          success: false,
+          error: 'This WhatsApp Business Account is already connected to another user.'
+        });
+      }
+      if (workspace_id && wabaCheck.workspace_id && wabaCheck.workspace_id.toString() !== workspace_id.toString()) {
+        return res.status(400).json({
+          success: false,
+          error: 'This WhatsApp Business Account is already connected to another workspace.'
+        });
+      }
     }
 
     if (workspace_id) {
@@ -4557,7 +4920,10 @@ export const clearChat = async (req, res) => {
       return res.status(404).json({ success: false, error: 'Contact not found' });
     }
 
-    const platform = contact.source || 'whatsapp';
+    let platform = contact.source || 'whatsapp';
+    if (platform === 'baileys') {
+      platform = 'whatsapp';
+    }
     const contactNumber = contact.phone_number || contact.telegram_chat_id || contact.facebook_page_scoped_id || contact.instagram_scoped_id;
 
     let myPhoneNumber = contactNumber;
@@ -4607,7 +4973,7 @@ export const clearChat = async (req, res) => {
 
     const mockId = new mongoose.Types.ObjectId().toString();
 
-   await Message.create({
+    await Message.create({
       _id: mockId,
       user_id: userId,
       contact_id: contact._id,
@@ -4674,6 +5040,11 @@ export const clearChat = async (req, res) => {
         }
       }
     }
+    contact.last_incoming_message_at = null;
+    contact.last_outgoing_message_at = null;
+    contact.snooze_count = 0;
+    contact.is_snoozed = false;
+    await contact.save();
 
     return res.status(200).json({ success: true, message: 'Chat cleared successfully' });
   } catch (error) {
@@ -4682,11 +5053,189 @@ export const clearChat = async (req, res) => {
   }
 };
 
+export const deleteChat = async (req, res) => {
+  try {
+    const userId = req.user.owner_id;
+    const { workspace_id, contact_ids } = req.body;
+
+    if (!Array.isArray(contact_ids) || contact_ids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'contact_ids (array) is required'
+      });
+    }
+
+    const contactObjectIds = contact_ids
+      .filter(id => mongoose.Types.ObjectId.isValid(id))
+      .map(id => new mongoose.Types.ObjectId(id));
+
+    if (contactObjectIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No valid contact IDs provided'
+      });
+    }
+
+    // 1. Soft delete contacts
+    const contactUpdateResult = await Contact.updateMany(
+      {
+        _id: { $in: contactObjectIds },
+        user_id: userId,
+        deleted_at: null
+      },
+      {
+        $set: { deleted_at: new Date() }
+      }
+    );
+
+    // 2. Soft delete messages
+    const messageUpdateResult = await Message.updateMany(
+      {
+        contact_id: { $in: contactObjectIds },
+        user_id: userId,
+        deleted_at: null
+      },
+      {
+        $set: { deleted_at: new Date() }
+      }
+    );
+
+    // Emit socket event for real-time updates
+    const io = req.app.get('io');
+    if (io) {
+      contact_ids.forEach(id => {
+        io.emit('whatsapp:chat-deleted', {
+          contact_id: id,
+          user_id: userId.toString(),
+          workspace_id: workspace_id || null
+        });
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `${contactUpdateResult.modifiedCount} contact(s) and their messages deleted successfully.`,
+      data: {
+        deletedContactsCount: contactUpdateResult.modifiedCount,
+        deletedMessagesCount: messageUpdateResult.modifiedCount
+      }
+    });
+
+  } catch (error) {
+    console.error('Error deleting chats:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to delete chats',
+      details: error.message
+    });
+  }
+};
+
+export const sendProductMessage = async (req, res) => {
+  try {
+    const { product_id } = req.body;
+
+    if (!product_id) {
+      return res.status(400).json({ success: false, error: 'product_id is required' });
+    }
+
+    const product = await EcommerceProduct.findById(product_id).lean();
+    if (!product) {
+      return res.status(404).json({ success: false, error: 'Product not found' });
+    }
+
+    const product_name = product.name || 'Product Details';
+    const product_price = product.price ? (product.currency ? `${product.currency} ${product.price}` : product.price) : 'N/A';
+    const product_description = product.description || [
+      product.brand ? `Brand: ${product.brand}` : '',
+      product.category ? `Category: ${product.category}` : ''
+    ].filter(Boolean).join(' | ');
+    const product_image = product.image_urls && Array.isArray(product.image_urls)
+      ? product.image_urls.filter(Boolean).map(url => url.trim()).filter(url => url !== '')[0] || null
+      : null;
+    const product_url = product.url || 'https://shopify.com';
+    const source = product.type;
+
+    const messageCaption = `*${product_name}*\n*Price:* ${product_price}${product_description ? `\n\n${product_description}` : ''}`;
+
+    const productButton = {
+      type: 'url',
+      text: source === 'catalog' ? 'View Catalog' : 'View Product',
+      url: product_url
+    };
+
+    req.body.messageText = messageCaption.trim();
+    req.body.messageType = 'interactive';
+    req.body.interactiveType = 'cta_url';
+    if (product_image) {
+      req.body.mediaUrl = product_image;
+    }
+    req.body.buttons = [productButton];
+    req.body.buttonParams = {
+      display_text: productButton.text,
+      url: productButton.url
+    };
+
+    return await sendMessage(req, res);
+  } catch (error) {
+    console.error('Error in sendProductMessage:', error);
+    return res.status(500).json({ success: false, error: 'Failed to send product message', details: error.message });
+  }
+};
+
+export const sendOrderMessage = async (req, res) => {
+  try {
+    const { product_id, checkout_url, order_title, order_description } = req.body;
+
+    if (!product_id) {
+      return res.status(400).json({ success: false, error: 'product_id is required' });
+    }
+
+    const product = await EcommerceProduct.findById(product_id).lean();
+    if (!product) {
+      return res.status(404).json({ success: false, error: 'Product not found' });
+    }
+
+    const product_name = product.name || 'Item';
+    const order_amount = product.price ? (product.currency ? `${product.currency} ${product.price}` : product.price) : '$0.00';
+
+    const final_order_title = order_title || 'Order Information';
+    const final_order_desc = order_description || 'Click the link below to complete your secure payment.';
+
+    const orderText = `*${final_order_title}*\n\n*Product:* ${product_name}\n*Total Amount:* ${order_amount}\n\n${final_order_desc}`;
+
+    const orderButton = {
+      type: 'url',
+      text: 'View Order',
+      url: checkout_url || product.url || 'https://shopify.com/checkout'
+    };
+
+    req.body.messageText = orderText;
+    req.body.messageType = 'interactive';
+    req.body.interactiveType = 'cta_url';
+    req.body.buttons = [orderButton];
+    req.body.buttonParams = {
+      display_text: orderButton.text,
+      url: orderButton.url
+    };
+
+    return await sendMessage(req, res);
+  } catch (error) {
+    console.error('Error in sendOrderMessage:', error);
+    return res.status(500).json({ success: false, error: 'Failed to send order message', details: error.message });
+  }
+};
+
 export default {
   sendMessage,
+  sendProductMessage,
+  sendOrderMessage,
   getContactProfile,
   getMessages,
   togglePinChat,
+  toggleSnooze,
+  assignChatbot,
+  unassignChatbot,
   getRecentChats,
   assignChatToAgent,
   getConnectionStatus,
@@ -4701,6 +5250,7 @@ export default {
   getEmbbededSignupConnection,
   getMessageLogs,
   clearChat,
+  deleteChat,
   disconnectWhatsApp,
   getWabaList
 };

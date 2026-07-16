@@ -934,7 +934,6 @@ export const updateChatStatus = async (req, res) => {
           message: 'WhatsApp phone number not found or you do not own it'
         });
       }
-      businessPhoneNumber = phoneNumber.display_phone_number;
     }
 
     contact.chat_status = status;

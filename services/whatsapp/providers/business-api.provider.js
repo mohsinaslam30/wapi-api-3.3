@@ -98,6 +98,9 @@ function transcodeToWebp(inputBuffer) {
 const WHATSAPP_API_VERSION = 'v25.0';
 const WHATSAPP_GRAPH_API_APP_URL = 'https://graph.facebook.com';
 
+const globalMediaCache = new Map();
+const globalMediaUploadPromises = new Map();
+
 const MESSAGE_TYPES = {
   TEXT: 'text',
   IMAGE: 'image',
@@ -301,11 +304,12 @@ export default class BusinessAPIProvider extends BaseProvider {
             if (comp.type === 'header' && Array.isArray(comp.parameters)) {
               const resolvedParams = comp.parameters.map(p => {
                 if (p.type && p[p.type]) {
-                  let resolvedObj;
-                  if (p[p.type].link) {
-                    resolvedObj = { ...p, [p.type]: { ...p[p.type], link: this.getPublicMediaUrl(p[p.type].link) } };
-                  } else {
-                    resolvedObj = { ...p };
+                  let resolvedObj = { ...p };
+                  
+                  if (params.mediaId && ['image', 'video', 'document', 'audio'].includes(p.type.toLowerCase())) {
+                    resolvedObj[p.type] = { id: params.mediaId };
+                  } else if (p[p.type].link) {
+                    resolvedObj[p.type] = { ...p[p.type], link: this.getPublicMediaUrl(p[p.type].link) };
                   }
 
                   if (p.type === 'document' && !resolvedObj.document.filename) {
@@ -394,6 +398,15 @@ export default class BusinessAPIProvider extends BaseProvider {
 
   async sendWhatsAppAPIMessage(params) {
     const { phone_number_id, access_token, payload } = params;
+
+    if (payload && payload.to) {
+      const isBsuid = /^[A-Z]{2}\.\d+$/.test(payload.to.trim());
+      if (isBsuid) {
+        payload.recipient = payload.to.trim();
+        delete payload.to;
+      }
+    }
+
     console.log("phone_number_id", phone_number_id);
     const apiUrl = `${WHATSAPP_GRAPH_API_APP_URL}/${WHATSAPP_API_VERSION}/${phone_number_id}/messages`;
     console.log(`[BusinessAPI] Calling API URL: ${apiUrl}`);
@@ -619,21 +632,42 @@ export default class BusinessAPIProvider extends BaseProvider {
 
     let contact = null;
     if (!params.fromCampaignSystem) {
-      contact = await Contact.findOneAndUpdate(
-        { phone_number: recipientNumber, created_by: userId },
-        {
-          $setOnInsert: {
-            phone_number: recipientNumber,
-            name: recipientNumber,
-            source: 'whatsapp',
-            user_id: userId,
-            created_by: userId,
-            status: 'lead'
-          },
-          $set: { deleted_at: null }
-        },
-        { new: true, upsert: true }
-      ).lean();
+      const query = {
+        created_by: userId,
+        $or: [
+          { phone_number: recipientNumber },
+          { whatsapp_username: recipientNumber },
+          { whatsapp_bsuid: recipientNumber }
+        ]
+      };
+
+      contact = await Contact.findOne(query).lean();
+
+      if (!contact) {
+        const isBsuid = /^[A-Z]{2}\.\d+$/.test(recipientNumber);
+        const isPhone = !isBsuid && /^\d+$/.test(recipientNumber);
+        const contactFields = {
+          name: recipientNumber,
+          source: 'whatsapp',
+          user_id: userId,
+          created_by: userId,
+          status: 'lead',
+          deleted_at: null
+        };
+        if (isBsuid) {
+          contactFields.whatsapp_bsuid = recipientNumber;
+        } else if (isPhone) {
+          contactFields.phone_number = recipientNumber;
+        } else {
+          contactFields.whatsapp_username = recipientNumber;
+        }
+
+        const newContact = await Contact.create(contactFields);
+        contact = newContact.toObject();
+      } else if (contact.deleted_at) {
+        await Contact.updateOne({ _id: contact._id }, { $set: { deleted_at: null } });
+        contact.deleted_at = null;
+      }
     } else {
       contact = { _id: params.contactId || null };
     }
@@ -653,29 +687,58 @@ export default class BusinessAPIProvider extends BaseProvider {
 
     if (targetFile) {
       if (targetFile.buffer || targetFile.url || targetFile.path) {
-        console.log('[BusinessAPI] Uploading media file:', {
-          mimetype: targetFile.mimetype,
-          originalname: targetFile.originalname,
-          size: targetFile.size || (targetFile.buffer ? targetFile.buffer.length : 'N/A'),
-          url: targetFile.url,
-          path: targetFile.path
-        });
-        const mediaResult = await this.processMediaUpload({
-          file: targetFile,
-          phone_number_id,
-          access_token,
-          expectedMessageType: messageType
-        }, userId);
-        mediaId = mediaResult.mediaId;
-        localFilePath = mediaResult.localPath;
-        fileMediaUrl = null;
-        isVoiceNote = mediaResult.isVoiceNote || false;
-        console.log('[BusinessAPI] Media upload result:', {
-          mediaId,
-          localFilePath,
-          isVoiceNote,
-          messageType: mediaResult.messageType
-        });
+        const cacheKey = targetFile.url ? `${phone_number_id}_${targetFile.url}` : null;
+        if (!targetFile.buffer && cacheKey && globalMediaCache.has(cacheKey)) {
+          const cached = globalMediaCache.get(cacheKey);
+          mediaId = cached.mediaId;
+          localFilePath = cached.localPath;
+          fileMediaUrl = null;
+          isVoiceNote = cached.isVoiceNote;
+          console.log('[BusinessAPI] Using cached mediaId:', mediaId, 'for', cacheKey);
+        } else {
+          let uploadPromise = null;
+          if (!targetFile.buffer && cacheKey && globalMediaUploadPromises.has(cacheKey)) {
+            uploadPromise = globalMediaUploadPromises.get(cacheKey);
+          } else {
+            console.log('[BusinessAPI] Uploading media file:', {
+              mimetype: targetFile.mimetype,
+              originalname: targetFile.originalname,
+              size: targetFile.size || (targetFile.buffer ? targetFile.buffer.length : 'N/A'),
+              url: targetFile.url,
+              path: targetFile.path
+            });
+            uploadPromise = this.processMediaUpload({
+              file: targetFile,
+              phone_number_id,
+              access_token,
+              expectedMessageType: messageType
+            }, userId);
+            if (!targetFile.buffer && cacheKey) {
+              globalMediaUploadPromises.set(cacheKey, uploadPromise);
+            }
+          }
+
+          try {
+            const mediaResult = await uploadPromise;
+            mediaId = mediaResult.mediaId;
+            localFilePath = mediaResult.localPath;
+            fileMediaUrl = null;
+            isVoiceNote = mediaResult.isVoiceNote || false;
+            console.log('[BusinessAPI] Media upload result:', {
+              mediaId,
+              localFilePath,
+              isVoiceNote,
+              messageType: mediaResult.messageType
+            });
+            if (!targetFile.buffer && cacheKey && mediaId) {
+              globalMediaCache.set(cacheKey, { mediaId, localPath: localFilePath, isVoiceNote });
+            }
+          } finally {
+            if (!targetFile.buffer && cacheKey) {
+              globalMediaUploadPromises.delete(cacheKey);
+            }
+          }
+        }
       }
     }
 
@@ -805,6 +868,10 @@ export default class BusinessAPIProvider extends BaseProvider {
           type: 'interactive',
           interactive: {
             type: 'cta_url',
+            header: (mediaId || finalMediaUrl) ? {
+              type: 'image',
+              image: mediaId ? { id: mediaId } : { link: finalMediaUrl }
+            } : undefined,
             body: {
               text: messageText
             },
@@ -813,6 +880,32 @@ export default class BusinessAPIProvider extends BaseProvider {
               parameters: {
                 display_text: buttonParams?.display_text || 'Visit',
                 url: buttonParams?.url || ''
+              }
+            }
+          }
+        };
+      }
+
+      if (interactiveType === 'poll') {
+        whatsappPayload = {
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: recipientNumber,
+          type: 'interactive',
+          interactive: {
+            type: 'poll',
+            body: {
+              text: params.pollParams?.question || messageText || 'Poll'
+            },
+            action: {
+              name: 'poll',
+              parameters: {
+                question: params.pollParams?.question || messageText || 'Poll',
+                options: (params.pollParams?.options || []).map((opt, i) => ({
+                  id: opt.id || `opt_${i}`,
+                  title: opt.title || opt.text || opt
+                })),
+                multiple_answers: !!params.pollParams?.allowMultiple
               }
             }
           }
@@ -859,10 +952,10 @@ export default class BusinessAPIProvider extends BaseProvider {
       access_token,
       payload: whatsappPayload
     });
-    const messageMeta = messageType === 'interactive'
+     const messageMeta = messageType === 'interactive'
       ? {
         interactiveType,
-        buttons: interactiveType === 'button' ? buttonParams : undefined,
+        buttons: (interactiveType === 'button' || interactiveType === 'cta_url') ? (buttonParams || params.buttons) : undefined,
         list: interactiveType === 'list' ? listParams : undefined,
         flowId: interactiveType === 'flow' ? params.flowId : undefined,
         flowToken: interactiveType === 'flow' ? (whatsappPayload.interactive.action.parameters.flow_token) : undefined,
@@ -919,7 +1012,8 @@ export default class BusinessAPIProvider extends BaseProvider {
         reaction_message_id: params.reactionMessageId || null,
         template_id: templateId || null,
         delivery_status: 'sent',
-        wa_status: 'sent'
+        wa_status: 'sent',
+        whatsapp_phone_number_id: params.whatsappPhoneNumber?._id || params.whatsappPhoneNumberId || null
       });
     }
 
@@ -942,22 +1036,33 @@ export default class BusinessAPIProvider extends BaseProvider {
     const myPhoneNumber = connection.display_phone_number || connection.display_phone_number;
 
     const contact = await Contact.findOne({
-      phone_number: contactNumber,
       created_by: userId,
+      $or: [
+        { phone_number: contactNumber },
+        { whatsapp_username: contactNumber },
+        { whatsapp_bsuid: contactNumber }
+      ],
       deleted_at: null
     });
 
+    const identifiers = [contactNumber];
+    if (contact) {
+      if (contact.phone_number) identifiers.push(contact.phone_number);
+      if (contact.whatsapp_username) identifiers.push(contact.whatsapp_username);
+      if (contact.whatsapp_bsuid) identifiers.push(contact.whatsapp_bsuid);
+    }
+
     const baseCondition = {
+      deleted_at: null,
       $or: [
+        ...(contact ? [{ contact_id: contact._id }] : []),
         {
-          sender_number: contactNumber,
-          recipient_number: myPhoneNumber,
-          deleted_at: null
+          sender_number: { $in: identifiers },
+          recipient_number: myPhoneNumber
         },
         {
           sender_number: myPhoneNumber,
-          recipient_number: contactNumber,
-          deleted_at: null
+          recipient_number: { $in: identifiers }
         }
       ]
     };
@@ -994,9 +1099,12 @@ export default class BusinessAPIProvider extends BaseProvider {
     let canChat = true;
     if (contact) {
       const lastInboundMessage = await Message.findOne({
-        sender_number: contactNumber,
-        recipient_number: myPhoneNumber,
-        deleted_at: null
+        deleted_at: null,
+        direction: 'inbound',
+        $or: [
+          { contact_id: contact._id },
+          { sender_number: { $in: identifiers } }
+        ]
       })
         .sort({ wa_timestamp: -1 })
         .lean();

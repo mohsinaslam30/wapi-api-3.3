@@ -74,11 +74,31 @@ export const processCampaignMessageJob = async (jobData) => {
 
 
   try {
-    const campaign = await Campaign.findById(campaignId)
-      .select('name template_id platform avoid_unsubscribers coupon_code waba_id user_id sent_at original_filename')
-      .lean();
+    const query = { _id: campaignId };
+    const projection = {
+      name: 1,
+      template_id: 1,
+      platform: 1,
+      avoid_unsubscribers: 1,
+      coupon_code: 1,
+      waba_id: 1,
+      user_id: 1,
+      sent_at: 1,
+      original_filename: 1,
+      is_paused: 1
+    };
+
+    if (recipient.contact_id) {
+      query['recipients.contact_id'] = recipient.contact_id;
+      projection.recipients = { $elemMatch: { contact_id: recipient.contact_id } };
+    } else {
+      query['recipients.phone_number'] = recipient.phone_number;
+      projection.recipients = { $elemMatch: { phone_number: recipient.phone_number } };
+    }
+
+    const campaign = await Campaign.findOne(query, projection).lean();
     if (!campaign) {
-      throw new Error(`Campaign ${campaignId} not found`);
+      throw new Error(`Campaign ${campaignId} not found or recipient is not part of this campaign`);
     }
 
     if (campaign.is_paused === true) {
@@ -86,11 +106,7 @@ export const processCampaignMessageJob = async (jobData) => {
       return { success: false, paused: true };
     }
 
-    const dbRecipient = campaign.recipients.find(r =>
-      recipient.contact_id
-        ? r.contact_id?.toString() === recipient.contact_id.toString()
-        : r.phone_number === recipient.phone_number
-    );
+    const dbRecipient = campaign.recipients && campaign.recipients[0];
 
     if (!dbRecipient || dbRecipient.status !== 'pending') {
       console.log(`[Job Processor] Recipient ${recipient.phone_number} is already processed (status: ${dbRecipient?.status || 'not found'}). Skipping.`);
@@ -213,7 +229,7 @@ export const processCampaignMessageJob = async (jobData) => {
 
         let msgType = 'text';
         let locationParams = {};
-         mediaUrlToSend = templateData.media_url;
+        mediaUrlToSend = templateData.media_url;
         if (!mediaUrlToSend && template.header && template.header.format === 'media' && template.header.media_url) {
           mediaUrlToSend = template.header.media_url;
         }
@@ -438,7 +454,7 @@ export const processCampaignMessageJob = async (jobData) => {
 
         let msgType = 'text';
         let locationParams = {};
-         mediaUrlToSend = templateData.media_url;
+        mediaUrlToSend = templateData.media_url;
         if (!mediaUrlToSend && template.header && template.header.format === 'media' && template.header.media_url) {
           mediaUrlToSend = template.header.media_url;
         }
@@ -617,7 +633,7 @@ export const processCampaignMessageJob = async (jobData) => {
       if (dbMessage && unifiedWhatsAppService.io) {
         try {
           const contact = await Contact.findById(dbMessage.contact_id).lean();
-          unifiedWhatsAppService.io.emit('whatsapp:message', {
+          const messagePayload = {
             id: dbMessage._id.toString(),
             messageId: dbMessage._id.toString(),
             senderNumber: dbMessage.sender_number,
@@ -629,8 +645,12 @@ export const processCampaignMessageJob = async (jobData) => {
             fromMe: dbMessage.from_me,
             direction: dbMessage.direction,
             createdAt: dbMessage.wa_timestamp,
-            delivered_at: dbMessage.wa_timestamp,
+            delivered_at: dbMessage.delivered_at || dbMessage.wa_timestamp,
             delivery_status: dbMessage.delivery_status || 'delivered',
+            wa_status: dbMessage.wa_status || dbMessage.delivery_status || 'delivered',
+            is_delivered: dbMessage.is_delivered ?? true,
+            is_seen: dbMessage.is_seen ?? false,
+            seen_at: dbMessage.seen_at || null,
             contact_id: dbMessage.contact_id?.toString(),
             contactId: dbMessage.contact_id?.toString(),
             sender: { id: dbMessage.sender_number, name: 'Agent' },
@@ -643,7 +663,42 @@ export const processCampaignMessageJob = async (jobData) => {
             platform: dbMessage.platform || campaignPlatform,
             template: template || null,
             metadata: dbMessage.metadata || null
-          });
+          };
+          unifiedWhatsAppService.io.emit('whatsapp:message', messagePayload);
+
+          const statusPayload = {
+            id: dbMessage._id.toString(),
+            wa_message_id: dbMessage.wa_message_id || dbMessage.platform_message_id || null,
+            content: dbMessage.content,
+            interactiveData: dbMessage.interactive_data || null,
+            messageType: dbMessage.message_type,
+            fileUrl: dbMessage.file_url || null,
+            template: template || null,
+            createdAt: dbMessage.wa_timestamp,
+            can_chat: true,
+            delivered_at: dbMessage.delivered_at || dbMessage.wa_timestamp,
+            delivery_status: dbMessage.delivery_status || 'delivered',
+            is_delivered: dbMessage.is_delivered ?? true,
+            is_seen: dbMessage.is_seen ?? false,
+            seen_at: dbMessage.seen_at || null,
+            wa_status: dbMessage.wa_status || dbMessage.delivery_status || 'delivered',
+            direction: dbMessage.direction || 'outbound',
+            sender: {
+              id: dbMessage.sender_number,
+              name: 'Agent'
+            },
+            recipient: {
+              id: dbMessage.recipient_number,
+              name: contact ? contact.name : dbMessage.recipient_number
+            },
+            submission_id: dbMessage.submission_id?._id || dbMessage.submission_id || null,
+            fields: [],
+            user_id: dbMessage.user_id?.toString(),
+            contact_id: dbMessage.contact_id?.toString(),
+            whatsapp_phone_number_id: null
+          };
+          console.log('[campaign-job-processor] Emitting whatsapp:status for non-whatsapp message:', statusPayload);
+          unifiedWhatsAppService.io.emit('whatsapp:status', statusPayload);
         } catch (socketErr) {
           console.error('Error emitting socket message for non-whatsapp campaign:', socketErr);
         }
@@ -1058,7 +1113,16 @@ export const processCampaignMessageJob = async (jobData) => {
       fromCampaignSystem: true,
       ignoreUnsubscribe: campaign.avoid_unsubscribers === false,
       campaignOriginalFilename: campaign.original_filename,
-      templateObj: template
+      templateObj: template,
+      file: templateData.media_url ? (() => {
+        let mt = 'image';
+        if (templateData.media_url.endsWith('.mp4') || templateData.media_url.includes('video')) mt = 'video';
+        else if (templateData.media_url.endsWith('.pdf') || templateData.media_url.includes('document')) mt = 'document';
+        return {
+          url: templateData.media_url,
+          mimetype: mt === 'video' ? 'video/mp4' : mt === 'document' ? 'application/pdf' : 'image/jpeg'
+        };
+      })() : undefined
     };
 
     console.log('Template components for sending:', templateComponents);
@@ -1098,7 +1162,9 @@ export const processCampaignMessageJob = async (jobData) => {
           components: []
         },
         whatsapp_phone_number_id: selectedPhoneNumber._id,
-        provider: result.provider
+        provider: result.provider,
+        delivery_status: 'sent',
+        wa_status: 'sent'
       });
       existingMessage = createdMsg.toObject();
     } else {
@@ -1146,6 +1212,12 @@ export const processCampaignMessageJob = async (jobData) => {
           fromMe: existingMessage.from_me,
           direction: existingMessage.direction,
           createdAt: existingMessage.wa_timestamp,
+          delivered_at: existingMessage.delivered_at || null,
+          delivery_status: existingMessage.delivery_status || 'sent',
+          wa_status: existingMessage.wa_status || 'sent',
+          is_delivered: existingMessage.is_delivered || false,
+          is_seen: existingMessage.is_seen || false,
+          seen_at: existingMessage.seen_at || null,
           contact_id: existingMessage.contact_id?.toString(),
           contactId: existingMessage.contact_id?.toString(),
           sender: { id: existingMessage.sender_number, name: existingMessage.sender_number },
@@ -1160,6 +1232,40 @@ export const processCampaignMessageJob = async (jobData) => {
         };
         console.log('[campaign-job-processor] Emitting whatsapp:message with payload:', payload);
         unifiedWhatsAppService.io.emit('whatsapp:message', payload);
+
+        const statusPayload = {
+          id: existingMessage._id.toString(),
+          wa_message_id: existingMessage.wa_message_id || null,
+          content: existingMessage.content,
+          interactiveData: existingMessage.interactive_data || null,
+          messageType: existingMessage.message_type,
+          fileUrl: existingMessage.file_url || null,
+          template: template || null,
+          createdAt: existingMessage.wa_timestamp,
+          can_chat: true,
+          delivered_at: existingMessage.delivered_at || null,
+          delivery_status: existingMessage.delivery_status || 'sent',
+          is_delivered: existingMessage.is_delivered || false,
+          is_seen: existingMessage.is_seen || false,
+          seen_at: existingMessage.seen_at || null,
+          wa_status: existingMessage.wa_status || 'sent',
+          direction: existingMessage.direction || 'outbound',
+          sender: {
+            id: existingMessage.sender_number,
+            name: existingMessage.sender_number
+          },
+          recipient: {
+            id: existingMessage.recipient_number,
+            name: contact ? contact.name : existingMessage.recipient_number
+          },
+          submission_id: existingMessage.submission_id?._id || existingMessage.submission_id || null,
+          fields: [],
+          user_id: existingMessage.user_id?.toString(),
+          contact_id: existingMessage.contact_id?.toString(),
+          whatsapp_phone_number_id: selectedPhoneNumber._id?.toString()
+        };
+        console.log('[campaign-job-processor] Emitting whatsapp:status with payload:', statusPayload);
+        unifiedWhatsAppService.io.emit('whatsapp:status', statusPayload);
       } catch (socketErr) {
         console.error('Error emitting socket message for whatsapp campaign:', socketErr);
       }
@@ -1184,7 +1290,7 @@ export const processCampaignMessageJob = async (jobData) => {
             "stats.pending_count": -1
           }
         },
-        { new: true, select: 'stats sent_at', lean: true }
+        { new: true, select: 'stats sent_at parent_recurring_id', lean: true }
       );
     } else {
       updatedCampaign = await Campaign.findOneAndUpdate(
@@ -1205,8 +1311,42 @@ export const processCampaignMessageJob = async (jobData) => {
             "stats.pending_count": -1
           }
         },
-        { new: true, select: 'stats sent_at', lean: true }
+        { new: true, select: 'stats sent_at parent_recurring_id', lean: true }
       );
+    }
+
+    // Propagate sent count to parent recurring campaign so its Overview/Messages/Insights show correct data
+    const parentId = campaign.parent_recurring_id || updatedCampaign?.parent_recurring_id;
+    if (parentId) {
+      try {
+        if (recipient.contact_id) {
+          await Campaign.findOneAndUpdate(
+            { _id: parentId, "recipients.contact_id": recipient.contact_id },
+            {
+              $set: {
+                "recipients.$.status": 'sent',
+                "recipients.$.sent_at": new Date(),
+                "recipients.$.message_id": result.messageId || result.id
+              },
+              $inc: { "stats.sent_count": 1, "stats.pending_count": -1 }
+            }
+          );
+        } else {
+          await Campaign.findOneAndUpdate(
+            { _id: parentId, "recipients.phone_number": recipient.phone_number, "recipients.status": "pending" },
+            {
+              $set: {
+                "recipients.$.status": 'sent',
+                "recipients.$.sent_at": new Date(),
+                "recipients.$.message_id": result.messageId || result.id
+              },
+              $inc: { "stats.sent_count": 1, "stats.pending_count": -1 }
+            }
+          );
+        }
+      } catch (parentErr) {
+        console.error('[campaign-job-processor] Failed to sync stats to parent recurring campaign:', parentErr.message);
+      }
     }
 
     if (updatedCampaign && updatedCampaign.stats) {
@@ -1270,7 +1410,7 @@ export const processCampaignMessageJob = async (jobData) => {
       updatedCampaign = await Campaign.findOneAndUpdate(
         { _id: campaignId, "recipients.contact_id": recipient.contact_id },
         updateQuery,
-        { new: true, select: 'stats sent_at', lean: true }
+        { new: true, select: 'stats sent_at parent_recurring_id', lean: true }
       );
     } else {
       updatedCampaign = await Campaign.findOneAndUpdate(
@@ -1280,8 +1420,26 @@ export const processCampaignMessageJob = async (jobData) => {
           "recipients.status": "pending"
         },
         updateQuery,
-        { new: true, select: 'stats sent_at', lean: true }
+        { new: true, select: 'stats sent_at parent_recurring_id', lean: true }
       );
+    }
+
+    // Propagate failed count to parent recurring campaign
+    const parentId = campaign?.parent_recurring_id || updatedCampaign?.parent_recurring_id;
+    if (parentId) {
+      try {
+        const parentFailQuery = {
+          $set: { "recipients.$.status": 'failed', "recipients.$.failed_at": new Date(), "recipients.$.failure_reason": error.message },
+          $inc: { "stats.failed_count": 1, "stats.pending_count": -1 }
+        };
+        if (recipient.contact_id) {
+          await Campaign.findOneAndUpdate({ _id: parentId, "recipients.contact_id": recipient.contact_id }, parentFailQuery);
+        } else {
+          await Campaign.findOneAndUpdate({ _id: parentId, "recipients.phone_number": recipient.phone_number, "recipients.status": "pending" }, parentFailQuery);
+        }
+      } catch (parentErr) {
+        console.error('[campaign-job-processor] Failed to sync failed stats to parent recurring campaign:', parentErr.message);
+      }
     }
 
     if (updatedCampaign && updatedCampaign.stats) {

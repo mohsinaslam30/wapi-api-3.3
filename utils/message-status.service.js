@@ -82,7 +82,7 @@ export const updateReadStatus = async (messageId, status, timestamp = null) => {
 };
 
 
-export const updateWhatsAppStatus = async (waMessageId, status, timestamp = null) => {
+export const updateWhatsAppStatus = async (waMessageId, status, timestamp = null, failureReason = null) => {
   try {
     if (!waMessageId) {
       throw new Error('WhatsApp message ID is required');
@@ -157,7 +157,7 @@ export const updateWhatsAppStatus = async (waMessageId, status, timestamp = null
 
     try {
       const { updateCampaignStatsFromMessage } = await import('./campaign-stats.service.js');
-      await updateCampaignStatsFromMessage(updatedMessage._id.toString(), status, timestamp);
+      await updateCampaignStatsFromMessage(updatedMessage._id.toString(), status, timestamp, failureReason);
     } catch (campaignError) {
       console.error('Error updating campaign stats:', campaignError);
     }

@@ -203,12 +203,46 @@ const CampaignSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  is_recurring: {
+    type: Boolean,
+    default: false
+  },
+  recurring_pattern: {
+    type: String,
+    enum: ['daily', 'weekly', 'monthly', 'custom_cron'],
+    default: 'monthly'
+  },
+  cron_expression: {
+    type: String,
+    default: null
+  },
+  recurring_end_date: {
+    type: Date,
+    default: null
+  },
+  parent_recurring_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Campaign',
+    default: null
+  },
+  next_run_at: {
+    type: Date,
+    default: null
+  },
   avoid_unsubscribers: {
     type: Boolean,
     default: true
   },
   scheduled_at: {
     type: Date,
+    default: null
+  },
+  batch_size: {
+    type: Number,
+    default: null
+  },
+  pause_between_batches: {
+    type: Number,
     default: null
   },
   sent_at: {
@@ -226,7 +260,7 @@ const CampaignSchema = new mongoose.Schema({
 
   status: {
     type: String,
-    enum: ['draft', 'scheduled', 'sending', 'completed', 'failed', 'cancelled', 'completed_with_errors'],
+    enum: ['draft', 'scheduled', 'recurring', 'sending', 'completed', 'failed', 'cancelled', 'completed_with_errors'],
     default: 'draft'
   },
   is_paused: {
@@ -315,6 +349,7 @@ CampaignSchema.statics.forUser = function (userId) {
 CampaignSchema.statics.getScheduledCampaigns = function () {
   return this.find({
     is_scheduled: true,
+    is_recurring: { $ne: true },
     status: 'scheduled',
     scheduled_at: { $lte: new Date() },
     deleted_at: null

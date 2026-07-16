@@ -1,5 +1,6 @@
 import BusinessAPIProvider from './providers/business-api.provider.js';
 import BaileysProvider from './providers/baileys.provider.js';
+
 import db from '../../models/index.js';
 const {
   WhatsappConnection,
@@ -42,7 +43,7 @@ class UnifiedWhatsAppService {
           }
           const contact = await Contact.findById(contact_id);
           if (contact && ['telegram', 'facebook', 'instagram'].includes(contact.source)) {
-             return;
+            return;
           }
 
           const lastMessage = await Message.findOne({
@@ -192,17 +193,13 @@ class UnifiedWhatsAppService {
       templateId
     } = messageParams;
 
-    if (contactId && !messageParams.ignoreUnsubscribe) {
-      const contact = await Contact.findById(contactId);
-      if (contact?.is_unsubscribed) {
-        throw new Error('Contact has unsubscribed and cannot receive messages.');
-      }
-    }
-
-    if (contactId && !recipientNumber) {
+    if (contactId) {
       const contact = await Contact.findById(contactId);
       if (contact) {
-        recipientNumber = contact.phone_number;
+        if (contact.is_unsubscribed && !messageParams.ignoreUnsubscribe) {
+          throw new Error('Contact has unsubscribed and cannot receive messages.');
+        }
+        recipientNumber = contact.whatsapp_bsuid || contact.whatsapp_username || recipientNumber || contact.phone_number;
       }
     }
 
@@ -271,7 +268,7 @@ class UnifiedWhatsAppService {
         if (!finalHeaderUrl && template?.header && ['IMAGE', 'VIDEO', 'DOCUMENT', 'MEDIA'].includes((template.header.format || '').toUpperCase())) {
           finalHeaderUrl = template.header.media_url;
           headerType = (template.header.media_type || template.header.format || 'image').toLowerCase();
-          if (headerType === 'media') headerType = 'image'; 
+          if (headerType === 'media') headerType = 'image';
           console.log(`[UnifiedService] Auto-injecting template header from DB: ${headerType} -> ${finalHeaderUrl}`);
         }
 
@@ -552,7 +549,7 @@ class UnifiedWhatsAppService {
     if (recipientNumber) {
       await Contact.updateOne(
         { phone_number: recipientNumber, created_by: userId },
-        { last_outgoing_message_at: new Date() }
+        { last_outgoing_message_at: new Date(), snooze_count: 0, is_snoozed: false }
       );
     }
 

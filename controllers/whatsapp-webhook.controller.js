@@ -162,30 +162,40 @@ export const handleFacebookInstagramIncoming = async (req, res, io = null) => {
           const matchedPage = connection.pages?.find(p => p.instagram_account_id === pageOrAccountId || p.page_id === pageOrAccountId);
           pageAccessToken = matchedPage?.page_access_token || connection.pages?.[0]?.page_access_token || connection.access_token;
         } else {
-          const activeIgConns = await InstagramConnection.find({ is_active: true });
-          for (const conn of activeIgConns) {
-            if (conn.access_token && conn.access_token.startsWith('IGAA')) {
-              try {
-                const res = await axios.get(`https://graph.instagram.com/v22.0/${pageOrAccountId}?fields=id`, {
-                  params: { access_token: conn.access_token }
-                });
-                if (res.data && res.data.id === conn.ig_user_id) {
-                  console.log(`[Webhook] Resolved global ID ${pageOrAccountId} to IGSID ${conn.ig_user_id}`);
-                  connection = conn;
-                  platform = 'instagram';
-                  workspaceId = conn.workspace_id;
-                  userId = conn.user_id;
-                  connectionId = conn._id;
-                  pageAccessToken = conn.access_token;
+          connection = await FacebookConnection.findOne({ 'pages.page_id': pageOrAccountId, is_active: true });
+          if (connection) {
+            platform = 'facebook';
+            workspaceId = connection.workspace_id;
+            userId = connection.user_id;
+            connectionId = connection._id;
+            const matchedPage = connection.pages?.find(p => p.page_id === pageOrAccountId);
+            pageAccessToken = matchedPage?.page_access_token || connection.long_lived_access_token;
+          } else {
+            const activeIgConns = await InstagramConnection.find({ is_active: true });
+            for (const conn of activeIgConns) {
+              if (conn.access_token && conn.access_token.startsWith('IGA')) {
+                try {
+                  const res = await axios.get(`https://graph.instagram.com/v22.0/${pageOrAccountId}?fields=id`, {
+                    params: { access_token: conn.access_token }
+                  });
+                  if (res.data && res.data.id === conn.ig_user_id) {
+                    console.log(`[Webhook] Resolved global ID ${pageOrAccountId} to IGSID ${conn.ig_user_id}`);
+                    connection = conn;
+                    platform = 'instagram';
+                    workspaceId = conn.workspace_id;
+                    userId = conn.user_id;
+                    connectionId = conn._id;
+                    pageAccessToken = conn.access_token;
 
-                  if (conn.global_instagram_account_id !== pageOrAccountId) {
-                    await InstagramConnection.findByIdAndUpdate(conn._id, {
-                      global_instagram_account_id: pageOrAccountId
-                    });
+                    if (conn.global_instagram_account_id !== pageOrAccountId) {
+                      await InstagramConnection.findByIdAndUpdate(conn._id, {
+                        global_instagram_account_id: pageOrAccountId
+                      });
+                    }
+                    break;
                   }
-                  break;
+                } catch (e) {
                 }
-              } catch (e) {
               }
             }
           }
@@ -247,7 +257,7 @@ export const handleFacebookInstagramIncoming = async (req, res, io = null) => {
             if (automation) {
               let isUserFollowing = true;
 
-              if (body.object === 'instagram' && pageAccessToken && pageAccessToken.startsWith('IGAA')) {
+              if (body.object === 'instagram' && pageAccessToken && pageAccessToken.startsWith('IGA')) {
                 try {
                   const checkFollowUrl = `https://graph.instagram.com/v22.0/${senderId}?fields=is_user_follow_business&access_token=${pageAccessToken}`;
                   const checkRes = await axios.get(checkFollowUrl);
@@ -436,7 +446,7 @@ export const handleFacebookInstagramIncoming = async (req, res, io = null) => {
                   senderName = profileRes.data.name || `${profileRes.data.first_name || ''} ${profileRes.data.last_name || ''}`.trim() || 'Facebook User';
                 }
               } else {
-                const baseUrl = pageAccessToken.startsWith('IGAA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
+                const baseUrl = pageAccessToken.startsWith('IGA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
                 const profileUrl = `${baseUrl}/v22.0/${senderId}?fields=username,name&access_token=${pageAccessToken}`;
                 const profileRes = await axios.get(profileUrl);
                 senderName = profileRes.data.name || profileRes.data.username || 'Instagram User';
@@ -485,7 +495,7 @@ export const handleFacebookInstagramIncoming = async (req, res, io = null) => {
                   updatedName = profileRes.data.name || `${profileRes.data.first_name || ''} ${profileRes.data.last_name || ''}`.trim() || null;
                 }
               } else {
-                const baseUrl = pageAccessToken.startsWith('IGAA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
+                const baseUrl = pageAccessToken.startsWith('IGA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
                 const profileUrl = `${baseUrl}/v22.0/${senderId}?fields=username,name&access_token=${pageAccessToken}`;
                 const profileRes = await axios.get(profileUrl);
                 updatedName = profileRes.data.name || profileRes.data.username || null;
@@ -501,6 +511,8 @@ export const handleFacebookInstagramIncoming = async (req, res, io = null) => {
         }
 
         contactDoc.last_incoming_message_at = new Date();
+        contactDoc.snooze_count = 0;
+        contactDoc.is_snoozed = false;
         if (contactDoc.deleted_at) {
           contactDoc.deleted_at = null;
         }
@@ -738,25 +750,55 @@ export const handleFacebookInstagramIncoming = async (req, res, io = null) => {
               assigned_by: userId
             }).lean();
 
+            let assignedChatbotId = null;
+
             if (chatAssignment && chatAssignment.chatbot_id) {
               const isExpired = chatAssignment.chatbot_expires_at && new Date() > new Date(chatAssignment.chatbot_expires_at);
               if (!isExpired) {
-                console.log(`[Facebook/Instagram Webhook] Forwarding message to assigned chatbot ${chatAssignment.chatbot_id}`);
-                await sendAutomatedReply({
-                  wabaId: null,
-                  contactId: contactDoc._id,
-                  replyType: 'chatbot',
-                  replyId: chatAssignment.chatbot_id,
-                  senderNumber: senderId,
-                  incomingText: content,
-                  userId: userId,
-                  whatsappPhoneNumberId: null
-                });
-                automatedHandled = true;
+                assignedChatbotId = chatAssignment.chatbot_id;
               } else {
                 console.log(`[Facebook/Instagram Webhook] Chatbot assignment expired for ${senderId}`);
                 await db.ChatAssignment.findByIdAndUpdate(chatAssignment._id, { chatbot_id: null, chatbot_expires_at: null });
               }
+            } else if (contactDoc.assigned_chatbot && !contactDoc.chatbot_paused) {
+                assignedChatbotId = contactDoc.assigned_chatbot;
+            }
+
+            if (assignedChatbotId) {
+                let finalContent = content;
+
+                if (messageType === 'audio' && fileUrl) {
+                    const { default: Chatbot } = await import('../models/chatbot.model.js');
+                    const chatbot = await Chatbot.findById(assignedChatbotId).populate('ai_model').lean();
+                    if (chatbot && chatbot.voice_settings && chatbot.voice_settings.enabled) {
+                        const { transcribeAudio } = await import('../utils/voice-ai.service.js');
+                        console.log(`[Facebook/Instagram Webhook] Transcribing incoming audio message...`);
+                        try {
+                            const transcript = await transcribeAudio(fileUrl, chatbot.api_key, chatbot.ai_model);
+                            if (transcript) {
+                                finalContent = transcript;
+                                console.log('[Facebook/Instagram Webhook] Transcription successful:', transcript);
+                            }
+                        } catch (err) {
+                            console.error('[Facebook/Instagram Webhook] Transcription failed:', err.message);
+                        }
+                    }
+                }
+
+                if (finalContent) {
+                    console.log(`[Facebook/Instagram Webhook] Forwarding message to assigned chatbot ${assignedChatbotId}`);
+                    await sendAutomatedReply({
+                      wabaId: null,
+                      contactId: contactDoc._id,
+                      replyType: 'chatbot',
+                      replyId: assignedChatbotId,
+                      senderNumber: senderId,
+                      incomingText: finalContent,
+                      userId: userId,
+                      whatsappPhoneNumberId: null
+                    });
+                    automatedHandled = true;
+                }
             }
           }
           if (!automatedHandled) {
@@ -869,31 +911,67 @@ export const handleIncomingMessage = async (req, res, io = null) => {
 
     const contact = await import('../models/index.js');
     const Contact = contact.Contact;
-    const waName = value?.contacts?.[0]?.profile?.name || message.from;
+    const senderContact = value?.contacts?.find(c => c.wa_id === message.from) || value?.contacts?.[0];
+    console.log("senderContact?.profile" , senderContact?.profile);
+    const waName = senderContact?.profile?.name || message.from;
+    const waUsername = senderContact?.profile?.username || senderContact?.username || null;
+    const waBsuid = senderContact?.user_id || null;
 
-    let contactDoc = await Contact.findOneAndUpdate(
-      { phone_number: message.from, created_by: whatsappPhoneNumber.user_id },
-      {
-        $setOnInsert: {
-          phone_number: message.from,
-          name: waName,
-          source: 'whatsapp',
-          user_id: whatsappPhoneNumber.user_id,
-          created_by: whatsappPhoneNumber.user_id,
-          status: 'lead'
-        },
-        $set: { deleted_at: null }
-      },
-      { new: true, upsert: true }
-    );
+    let contactDoc = await Contact.findOne({
+      created_by: whatsappPhoneNumber.user_id,
+      $or: [
+        { phone_number: message.from },
+        { whatsapp_username: message.from },
+        ...(waBsuid ? [{ whatsapp_bsuid: waBsuid }] : [])
+      ]
+    });
+
+    if (!contactDoc) {
+      const isPhone = /^\d+$/.test(message.from);
+      const contactFields = {
+        name: waName,
+        source: 'whatsapp',
+        user_id: whatsappPhoneNumber.user_id,
+        created_by: whatsappPhoneNumber.user_id,
+        status: 'lead',
+        deleted_at: null
+      };
+      if (isPhone) {
+        contactFields.phone_number = message.from;
+      }
+      if (waUsername) {
+        contactFields.whatsapp_username = waUsername;
+      } else if (!isPhone) {
+        contactFields.whatsapp_username = message.from;
+      }
+      if (waBsuid) {
+        contactFields.whatsapp_bsuid = waBsuid;
+      }
+
+      contactDoc = await Contact.create(contactFields);
+    } else {
+      let needsSave = false;
+      if (waUsername && contactDoc.whatsapp_username !== waUsername) {
+        contactDoc.whatsapp_username = waUsername;
+        needsSave = true;
+      }
+      if (waBsuid && contactDoc.whatsapp_bsuid !== waBsuid) {
+        contactDoc.whatsapp_bsuid = waBsuid;
+        needsSave = true;
+      }
+      if (contactDoc.deleted_at !== null) {
+        contactDoc.deleted_at = null;
+        needsSave = true;
+      }
+      if (needsSave) {
+        await contactDoc.save();
+      }
+    }
 
     if (contactDoc.name === contactDoc.phone_number && waName !== message.from) {
       contactDoc.name = waName;
       await contactDoc.save();
     }
-
-
-    contactDoc = await Contact.findById(contactDoc._id);
 
     let automatedHandled = false;
 
@@ -1273,6 +1351,8 @@ export const handleIncomingMessage = async (req, res, io = null) => {
       }
     }
 
+    let formData = null;
+
     if (message.type === 'interactive' && message.interactive?.type === 'nfm_reply') {
       try {
         const { default: appointmentWebhookService } = await import('../services/whatsapp/appointment-webhook.service.js');
@@ -1283,6 +1363,7 @@ export const handleIncomingMessage = async (req, res, io = null) => {
           const submission = await metaFlowService.handleFlowSubmission(message, whatsappPhoneNumber, contactDoc);
           if (submission?._id) {
             messageDoc.submission_id = submission._id;
+            formData = submission.data; 
             await messageDoc.save();
             console.log(`[Webhook] Linked submission ${submission._id} to message ${messageDoc._id}`);
           }
@@ -1471,6 +1552,7 @@ export const handleIncomingMessage = async (req, res, io = null) => {
         message: automationMessage,
         interactive_id: interactiveId,
         textContent: content,
+        form_data: formData,
         senderNumber: message.from,
         recipientNumber: whatsappPhoneNumber.display_phone_number,
         messageType: message.type,
@@ -1493,10 +1575,14 @@ export const handleIncomingMessage = async (req, res, io = null) => {
       const config = await WabaConfiguration.findOne({ waba_id: wabaId });
 
       contactDoc.last_incoming_message_at = new Date();
+      contactDoc.snooze_count = 0;
+      contactDoc.is_snoozed = false;
       if (!contactDoc.user_id) {
         contactDoc.user_id = whatsappPhoneNumber.user_id;
       }
       await contactDoc.save();
+
+      let assignedChatbotId = null;
 
       const chatAssignment = await db.ChatAssignment.findOne({
         sender_number: message.from,
@@ -1508,29 +1594,51 @@ export const handleIncomingMessage = async (req, res, io = null) => {
       if (chatAssignment && chatAssignment.chatbot_id) {
         const isExpired = chatAssignment.chatbot_expires_at && new Date() > new Date(chatAssignment.chatbot_expires_at);
         if (!isExpired) {
-          console.log(`[Webhook] Forwarding message to assigned chatbot ${chatAssignment.chatbot_id}`);
-          await sendAutomatedReply({
-            wabaId,
-            contactId: contactDoc._id,
-            replyType: 'chatbot',
-            replyId: chatAssignment.chatbot_id,
-            senderNumber: message.from,
-            incomingText: content,
-            userId: whatsappPhoneNumber.user_id,
-            whatsappPhoneNumberId: whatsappPhoneNumber._id
-          });
-          automatedHandled = true;
+          assignedChatbotId = chatAssignment.chatbot_id;
         } else {
           console.log(`[Webhook] Chatbot assignment expired for ${message.from}`);
           await db.ChatAssignment.findByIdAndUpdate(chatAssignment._id, { chatbot_id: null, chatbot_expires_at: null });
         }
+      } else if (contactDoc.assigned_chatbot && !contactDoc.chatbot_paused) {
+          assignedChatbotId = contactDoc.assigned_chatbot;
+      }
+
+      let finalContent = content;
+
+      if (message.type === 'audio' && storedPath && assignedChatbotId) {
+          const { default: Chatbot } = await import('../models/chatbot.model.js');
+          const chatbot = await Chatbot.findById(assignedChatbotId).populate('ai_model').lean();
+          if (chatbot && chatbot.voice_settings && chatbot.voice_settings.enabled) {
+              const { transcribeAudio } = await import('../utils/voice-ai.service.js');
+              console.log(`[Webhook] Transcribing incoming WhatsApp audio message...`);
+              const transcript = await transcribeAudio(storedPath, chatbot.api_key, chatbot.ai_model);
+              if (transcript) {
+                  finalContent = transcript;
+                  console.log('[Webhook] Transcription successful:', transcript);
+              }
+          }
+      }
+
+      if (assignedChatbotId && finalContent) {
+          console.log(`[Webhook] Forwarding message to assigned chatbot ${assignedChatbotId}`);
+          await sendAutomatedReply({
+            wabaId,
+            contactId: contactDoc._id,
+            replyType: 'chatbot',
+            replyId: assignedChatbotId,
+            senderNumber: message.from,
+            incomingText: finalContent,
+            userId: whatsappPhoneNumber.user_id,
+            whatsappPhoneNumberId: whatsappPhoneNumber._id
+          });
+          automatedHandled = true;
       }
 
       if (!automatedHandled) {
         await processAutomatedPipeline({
           workspaceId: whatsappPhoneNumber.waba_id?.workspace_id,
           contactDoc,
-          incomingText: content,
+          incomingText: finalContent,
           channel: 'whatsapp',
           accountId: message.from,
           userId: whatsappPhoneNumber.user_id,
@@ -1643,8 +1751,14 @@ export const handleStatusUpdate = async (req, res, io = null) => {
 
     console.log(`Processing status update for message ${waMessageId}: ${statusType}`);
 
+    let failureReason = null;
+    if (statusType === 'failed' && status.errors && status.errors.length > 0) {
+      console.log("Real error from Meta webhook status update:", JSON.stringify(status.errors, null, 2));
+      failureReason = status.errors[0].message || status.errors[0].title || `Error code: ${status.errors[0].code}`;
+    }
+
     try {
-      const updatedMessage = await updateWhatsAppStatus(waMessageId, statusType, timestamp);
+      const updatedMessage = await updateWhatsAppStatus(waMessageId, statusType, timestamp, failureReason);
 
       if (io && updatedMessage) {
         const populatedMessage = await Message.findById(updatedMessage._id)
@@ -1687,7 +1801,7 @@ export const handleStatusUpdate = async (req, res, io = null) => {
           fields: populatedMessage.submission_id?.fields || [],
           user_id: populatedMessage.user_id?.toString(),
           contact_id: populatedMessage.contact_id?.toString(),
-          whatsapp_phone_number_id: populatedMessage.whatsapp_connection_id?.toString()
+          whatsapp_phone_number_id: populatedMessage.whatsapp_phone_number_id?.toString() || populatedMessage.whatsapp_connection_id?.toString()
         };
 
         console.log("formattedMessage", formattedMessage);
@@ -1696,7 +1810,7 @@ export const handleStatusUpdate = async (req, res, io = null) => {
 
       try {
         const { updateCampaignStatsFromWhatsApp } = await import('../utils/campaign-stats.service.js');
-        const result = await updateCampaignStatsFromWhatsApp(waMessageId, statusType, timestamp);
+        const result = await updateCampaignStatsFromWhatsApp(waMessageId, statusType, timestamp, failureReason);
         console.log(`Campaign stats update result for ${waMessageId}:`, result);
       } catch (campaignError) {
         console.error(`Error updating campaign stats for message ${waMessageId}:`, campaignError);

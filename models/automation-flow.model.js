@@ -47,6 +47,7 @@ const automationFlowSchema = new mongoose.Schema({
           enum: [
             'trigger',
             'condition',
+            'advanced_condition',
             'action',
             'delay',
             'filter',
@@ -63,8 +64,10 @@ const automationFlowSchema = new mongoose.Schema({
             'assign_chatbot',
             'update_contact',
             'response_saver',
+            'send_google_form',
             'save_to_google_sheet',
             'create_calendar_event',
+            'create_google_meet',
             'appointment_flow',
             'api',
             'wait_for_reply',
@@ -72,7 +75,11 @@ const automationFlowSchema = new mongoose.Schema({
             'add_to_segment',
             'ask_and_wait',
             'send_sequence',
-            'custom'
+            'run_sub_flow',
+            'send_catalog',
+            'send_shopify',
+            'custom',
+            'move_to_pipeline_stage'
           ]
         },
         position: {

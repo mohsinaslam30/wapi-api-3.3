@@ -36,7 +36,8 @@ export const createTemplate = async (req, res) => {
       has_expiration,
       template_type = "standard",
       carousel_cards,
-      platform = "whatsapp"
+      platform = "whatsapp",
+      save_as_draft = false
     } = req.body;
 
     if (typeof buttons === "string") {
@@ -352,7 +353,9 @@ export const createTemplate = async (req, res) => {
       templateComponents.push(footerComponent);
     }
 
-    const detectedTemplateType = detectTemplateType(templateComponents, isCarouselTemplate, isAuthenticationCategory);
+    const detectedTemplateType = detectTemplateType(templateComponents, isCarouselTemplate, isAuthenticationCategory, call_permission, is_limited_time_offer);
+
+    const isDraft = save_as_draft === true || save_as_draft === 'true';
 
     const createdTemplate = await Template.create({
       user_id: req.user.owner_id,
@@ -373,12 +376,12 @@ export const createTemplate = async (req, res) => {
       template_type: detectedTemplateType,
       carousel_cards: isCarouselTemplate ? rawCarouselCards : undefined,
       authentication_options: authentication_options || undefined,
-      status: (platform === "whatsapp" && waba?.provider !== "baileys") ? "draft" : "approved",
+      status: isDraft ? "draft" : ((platform === "whatsapp" && waba?.provider !== "baileys") ? "draft" : "approved"),
       platform: platform,
     });
     console.log("createdTemplate", createdTemplate);
 
-    if (platform === "whatsapp" && waba && waba.provider !== "baileys") {
+    if (platform === "whatsapp" && waba && waba.provider !== "baileys" && !isDraft) {
       try {
         const metaPayload = buildMetaTemplatePayload(createdTemplate);
 
@@ -419,7 +422,7 @@ export const createTemplate = async (req, res) => {
     }
 
     return res.status(201).json({
-      message: (platform === "whatsapp" && waba?.provider !== "baileys") ? "Template submitted" : "Template created successfully",
+      message: (platform === "whatsapp" && waba?.provider !== "baileys" && !isDraft) ? "Template submitted" : (isDraft ? "Template saved as draft" : "Template created successfully"),
       template_id: createdTemplate._id,
     });
   } catch (error) {
@@ -1502,7 +1505,7 @@ const extractCarouselCards = (components) => {
 };
 
 
-const detectTemplateType = (components, isCarousel, isAuth) => {
+const detectTemplateType = (components, isCarousel, isAuth, call_permission, is_limited_time_offer) => {
   if (isCarousel) {
     const cards = extractCarouselCards(components);
     const hasProductHeader = cards.some((card) =>
@@ -1520,12 +1523,12 @@ const detectTemplateType = (components, isCarousel, isAuth) => {
   }
 
   const ltoComponent = components.find((c) => (c.type || "").toUpperCase() === "LIMITED_TIME_OFFER");
-  if (ltoComponent) {
+  if (is_limited_time_offer || ltoComponent) {
     return "limited_time_offer";
   }
 
   const callPermissionComponent = components.find((c) => (c.type || "").toUpperCase() === "CALL_PERMISSION_REQUEST");
-  if (callPermissionComponent) {
+  if (call_permission || callPermissionComponent) {
     return "call_permission";
   }
 
@@ -1535,21 +1538,9 @@ const detectTemplateType = (components, isCarousel, isAuth) => {
     c.buttons.some((btn) => (btn.type || "").toUpperCase() === "CATALOG")
   );
 
-  const hasProductMessage = components.some((c) =>
-    (c.type || "").toUpperCase() === "BODY" &&
-    c.text &&
-    (c.text.toLowerCase().includes("product") || c.text.toLowerCase().includes("catalog"))
-  );
-
-  if (hasCatalogButton || hasProductMessage) {
+  if (hasCatalogButton) {
     return "catalog";
   }
-
-  const hasCouponCode = components.some((c) =>
-    (c.type || "").toUpperCase() === "BODY" &&
-    c.text &&
-    (c.text.toLowerCase().includes("coupon") || c.text.toLowerCase().includes("code") || c.text.toLowerCase().includes("discount"))
-  );
 
   const hasCopyCodeButton = components.some((c) =>
     (c.type || "").toUpperCase() === "BUTTONS" &&
@@ -1557,7 +1548,7 @@ const detectTemplateType = (components, isCarousel, isAuth) => {
     c.buttons.some((btn) => (btn.type || "").toUpperCase() === "COPY_CODE")
   );
 
-  if (hasCouponCode || hasCopyCodeButton) {
+  if (hasCopyCodeButton) {
     return "coupon";
   }
 
@@ -1901,7 +1892,50 @@ export const updateTemplate = async (req, res) => {
       } else if (header_text === null) {
         updateData.header = null;
       }
+    }    // Re-detect template type on update
+    const isCurrentlyCarousel = ["carousel_product", "carousel_media"].includes(normalizedTemplateType);
+    const isCurrentlyAuth = (category || template.category || "").toUpperCase() === "AUTHENTICATION";
+
+    if (req.body.call_permission !== undefined) updateData.call_permission = req.body.call_permission;
+    if (req.body.is_limited_time_offer !== undefined) updateData.is_limited_time_offer = req.body.is_limited_time_offer;
+    if (req.body.offer_text !== undefined) updateData.offer_text = req.body.offer_text;
+    if (req.body.has_expiration !== undefined) updateData.has_expiration = req.body.has_expiration;
+
+    const testCallPermission = updateData.call_permission !== undefined ? updateData.call_permission : template.call_permission;
+    const testIsLimitedTimeOffer = updateData.is_limited_time_offer !== undefined ? updateData.is_limited_time_offer : template.is_limited_time_offer;
+
+    const testComponents = [];
+    const testBody = message_body !== undefined ? message_body : template.message_body;
+    if (testBody && !isCurrentlyAuth) {
+      testComponents.push({
+        type: "BODY",
+        text: testBody
+      });
     }
+    const testButtons = buttons !== undefined ? updateData.buttons : template.buttons;
+    if (testButtons && testButtons.length > 0) {
+      const buttonComponents = testButtons.map(btn => {
+        const btnType = (btn.type || "").toUpperCase();
+        const component = { type: btnType, text: btn.text };
+        if (btnType === "PHONE_CALL") {
+          component.phone_number = btn.phone_number;
+        } else if (btnType === "URL" || btnType === "WEBSITE") {
+          component.url = btn.url || btn.website_url;
+        } else if (btnType === "COPY_CODE") {
+          component.copy_button_text = btn.text;
+          if (btn.example) component.example = btn.example;
+        }
+        return component;
+      });
+
+      testComponents.push({
+        type: "BUTTONS",
+        buttons: buttonComponents
+      });
+    }
+
+    const detectedTemplateType = detectTemplateType(testComponents, isCurrentlyCarousel, isCurrentlyAuth, testCallPermission, testIsLimitedTimeOffer);
+    updateData.template_type = detectedTemplateType;
 
     const updatedLocalTemplate = await Template.findByIdAndUpdate(
       id,
@@ -1909,9 +1943,12 @@ export const updateTemplate = async (req, res) => {
       { returnDocument: 'after', runValidators: true }
     );
 
-    const shouldUpdateOnMeta = req.body.should_update_on_meta ?? true === true;
+    let shouldUpdateOnMeta = true;
+    if (req.body.should_update_on_meta !== undefined) {
+      shouldUpdateOnMeta = req.body.should_update_on_meta === true || req.body.should_update_on_meta === 'true';
+    }
 
-    if (shouldUpdateOnMeta && template.platform === "whatsapp" && waba) {
+    if (shouldUpdateOnMeta && template.platform === "whatsapp" && waba && waba.provider !== "baileys") {
       try {
         const wabaId = waba.whatsapp_business_account_id;
         const accessToken = waba.access_token;
@@ -2452,6 +2489,83 @@ export const migrateTemplate = async (req, res) => {
   }
 };
 
+export const publishTemplate = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.owner_id;
+
+    const template = await Template.findOne({
+      _id: id,
+      user_id: userId,
+      is_admin_template: { $ne: true },
+      deleted_at: null,
+    });
+
+    if (!template) {
+      return res.status(404).json({ message: "Template not found" });
+    }
+
+    if (template.status !== "draft") {
+      return res.status(400).json({ message: "Template is already published or pending" });
+    }
+
+    if (template.platform === "whatsapp") {
+      let waba = await WhatsappWaba.findOne({
+        _id: template.waba_id,
+        user_id: userId,
+        deleted_at: null,
+      });
+
+      if (!waba) {
+        return res.status(404).json({ message: "WhatsApp WABA not found" });
+      }
+
+      if (waba.provider !== "baileys") {
+        try {
+          const wabaId = waba.whatsapp_business_account_id;
+          const accessToken = waba.access_token;
+          const metaPayload = buildMetaTemplatePayload(template);
+
+          const createResponse = await submitTemplateToMeta(metaPayload, wabaId, accessToken);
+
+          await Template.findByIdAndUpdate(id, {
+            meta_template_id: createResponse.id || createResponse.name,
+            status: createResponse.status?.toLowerCase() || "pending",
+          });
+
+          return res.status(200).json({
+            success: true,
+            message: "Template published to WhatsApp successfully",
+          });
+        } catch (error) {
+          console.error("Error publishing Meta template:", error.response?.data || error.message);
+          const metaErrMsg = error.response?.data?.error?.error_user_msg || error.response?.data?.error?.message || error.message || "Unknown Meta API error";
+          return res.status(400).json({
+            success: false,
+            message: metaErrMsg,
+            error: metaErrMsg,
+          });
+        }
+      }
+    }
+
+    await Template.findByIdAndUpdate(id, {
+      status: "approved",
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Template published successfully",
+    });
+  } catch (error) {
+    console.error("Error publishing template:", error.message || error);
+    return res.status(500).json({
+      message: "Failed to publish template: " + error.message,
+      details: error.message,
+    });
+  }
+};
+
 export default {
   createTemplate,
   getAllTemplates,
@@ -2464,4 +2578,5 @@ export default {
   deleteTemplate,
   migrateTemplate,
   getAdminTemplatesForUsers,
+  publishTemplate,
 };

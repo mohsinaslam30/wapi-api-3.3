@@ -63,7 +63,7 @@ class OmnichannelService {
 
                 const contactDoc = await Contact.findOne(contactQuery).lean();
 
-                if (contactDoc && contactDoc.last_incoming_message_at) {
+                if (contactDoc && contactDoc.last_incoming_message_at && !options.reply_to_comment_id) {
                     const diffMs = Date.now() - new Date(contactDoc.last_incoming_message_at).getTime();
                     const diffHours = diffMs / (1000 * 60 * 60);
                     if (diffHours > 24) {

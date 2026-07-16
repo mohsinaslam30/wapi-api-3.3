@@ -392,23 +392,209 @@ export const sendAutomatedReply = async (params) => {
         if (replyType === 'chatbot') {
             const chatbot = await Chatbot.findById(replyId).populate('ai_model');
 
-            if (chatbot) {
-                const aiResponse = await callAIModel(userId, chatbot.ai_model, chatbot.api_key, `${chatbot.system_prompt}\n\nCustomer: ${incomingText}`);
-                console.log("airesponse", aiResponse);
+            if (chatbot && chatbot.status === 'active') {
+                if (contactDoc.chatbot_overrides) {
+                    const overrides = contactDoc.chatbot_overrides;
+                    if (overrides.tone) chatbot.tone = overrides.tone;
+                    if (overrides.message_limit !== undefined) chatbot.message_limit = overrides.message_limit;
+                    if (overrides.enable_human_handoff !== undefined) chatbot.enable_human_handoff = overrides.enable_human_handoff;
+                    if (overrides.handoff_keywords) chatbot.handoff_keywords = overrides.handoff_keywords;
+                    if (overrides.handoff_message) chatbot.handoff_message = overrides.handoff_message;
+                }
+
+                if (contactDoc.chatbot_paused) {
+                    console.log(`[Chatbot] AI Agent is paused for contact ${contactDoc._id}, skipping.`);
+                    return;
+                }
+
+                if (chatbot.message_limit > 0 && contactDoc.ai_message_count >= chatbot.message_limit) {
+                    console.log(`[Chatbot] Message limit reached for contact ${contactDoc._id}`);
+                    contactDoc.chatbot_paused = true;
+                    contactDoc.assigned_chatbot = null;
+                    await contactDoc.save();
+
+                    const io = unifiedWhatsAppService.io;
+                    if (io) {
+                        io.emit('agent:escalation', {
+                            contact_id: contactDoc._id.toString(),
+                            user_id: userId,
+                            message: "AI Agent reached maximum message limit",
+                            timestamp: new Date().toISOString()
+                        });
+                    }
+
+                    const handoffMessage = chatbot.handoff_message || "I'm connecting you with a human agent now. Someone will be with you shortly.";
+                    if (isOmnichannel) {
+                        await sendOmnichannelMessageHelper({
+                            contactDoc,
+                            messageType: 'text',
+                            text: handoffMessage
+                        });
+                    } else {
+                        await unifiedWhatsAppService.sendMessage(userId, {
+                            recipientNumber: params.senderNumber,
+                            messageText: handoffMessage,
+                            messageType: 'text',
+                            whatsappPhoneNumberId
+                        });
+                    }
+                    return;
+                }
+
+                if (chatbot.enable_human_handoff && chatbot.handoff_keywords && chatbot.handoff_keywords.length > 0) {
+                    const incomingTextLower = incomingText.toLowerCase();
+                    const isKeywordHandoff = chatbot.handoff_keywords.some(kw => incomingTextLower.includes(kw.toLowerCase()));
+
+                    if (isKeywordHandoff) {
+                        console.log(`[Chatbot] Keyword Handoff triggered for contact ${contactDoc._id}`);
+                        contactDoc.chatbot_paused = true;
+                        contactDoc.assigned_chatbot = null;
+                        await contactDoc.save();
+
+                        const io = unifiedWhatsAppService.io;
+                        if (io) {
+                            io.emit('agent:escalation', {
+                                contact_id: contactDoc._id.toString(),
+                                user_id: userId,
+                                message: "User requested human agent via keyword",
+                                timestamp: new Date().toISOString()
+                            });
+                        }
+
+                        const handoffMessage = chatbot.handoff_message || "I'm connecting you with a human agent now. Someone will be with you shortly.";
+                        
+                        if (isOmnichannel) {
+                            await sendOmnichannelMessageHelper({
+                                contactDoc,
+                                messageType: 'text',
+                                text: handoffMessage
+                            });
+                        } else {
+                            await unifiedWhatsAppService.sendMessage(userId, {
+                                recipientNumber: params.senderNumber,
+                                messageText: handoffMessage,
+                                messageType: 'text',
+                                whatsappPhoneNumberId
+                            });
+                        }
+                        return;
+                    }
+                }
+
+                let agentInstructions = `\n\n--- SYSTEM INSTRUCTIONS ---\nYou are an advanced AI Agent. You MUST respond with a valid JSON object only. Do not output markdown code blocks or any other text outside the JSON.\nThe JSON must have the following keys:\n- "reply_text": (string) Your actual helpful response to the user.`;
+                
+                if (chatbot.enable_human_handoff) {
+                    agentInstructions += `\n- "needs_handoff": (boolean) Set to true ONLY if the user is frustrated, angry, explicitly asks for a human agent, or if you cannot resolve their issue. Otherwise false.`;
+                } else {
+                    agentInstructions += `\n- "needs_handoff": (boolean) Always false.`;
+                }
+
+                if (chatbot.enable_google_meet) {
+                    agentInstructions += `\n- "action": (string) If the user explicitly asks for a meeting, a video call, or to schedule a call, return "generate_google_meet". Otherwise return null.`;
+                } else {
+                    agentInstructions += `\n- "action": (string) Always null.`;
+                }
+
+                const fullPrompt = `${chatbot.system_prompt || ''}${agentInstructions}\n\nCustomer: ${incomingText}`;
+
+                let aiResponseText = await callAIModel(userId, chatbot.ai_model, chatbot.api_key, fullPrompt);
+                let aiResponseObj;
+                
+                try {
+                    const cleanJsonStr = aiResponseText.replace(/^```json/im, '').replace(/^```/im, '').replace(/```$/m, '').trim();
+                    aiResponseObj = JSON.parse(cleanJsonStr);
+                } catch (e) {
+                    console.warn('[Chatbot] Failed to parse AI JSON, falling back to raw text');
+                    aiResponseObj = { reply_text: aiResponseText, needs_handoff: false, action: null };
+                }
+
+                if (chatbot.enable_human_handoff && aiResponseObj.needs_handoff) {
+                    console.log(`[Chatbot] Handoff triggered for contact ${contactDoc._id}`);
+                    contactDoc.chatbot_paused = true;
+                    contactDoc.assigned_chatbot = null;
+                    await contactDoc.save();
+
+                    const io = unifiedWhatsAppService.io;
+                    if (io) {
+                        io.emit('agent:escalation', {
+                            contact_id: contactDoc._id.toString(),
+                            user_id: userId,
+                            message: "AI Agent requested human handoff",
+                            timestamp: new Date().toISOString()
+                        });
+                    }
+                }
+
+                let finalReplyText = aiResponseObj.reply_text || "I'm having trouble processing that right now.";
+
+                if (chatbot.enable_google_meet && aiResponseObj.action === 'generate_google_meet') {
+                    try {
+                        const { default: GoogleAccount } = await import('../models/google-account.model.js');
+                        const { getCalendarClient } = await import('./google-api-helper.js');
+                        
+                        const googleAccount = await GoogleAccount.findOne({ user_id: userId, status: 'active', deleted_at: null });
+                        if (googleAccount) {
+                            const calendarClient = await getCalendarClient(googleAccount._id);
+                            const start = new Date();
+                            const end = new Date(start.getTime() + 60 * 60 * 1000);
+                            const event = await calendarClient.events.insert({
+                                calendarId: 'primary',
+                                conferenceDataVersion: 1,
+                                requestBody: {
+                                    summary: `Meeting with ${contactDoc.name || 'Client'}`,
+                                    start: { dateTime: start.toISOString() },
+                                    end: { dateTime: end.toISOString() },
+                                    conferenceData: { createRequest: { requestId: `meet_${Date.now()}` } }
+                                }
+                            });
+                            const meetLink = event.data.hangoutLink;
+                            if (meetLink) {
+                                finalReplyText += `\n\nHere is the Google Meet link for our meeting: ${meetLink}`;
+                            }
+                        }
+                    } catch (meetErr) {
+                        console.error('[Chatbot] Error generating Google Meet link:', meetErr);
+                    }
+                }
+
+                let messageTypeToSend = 'text';
+                let messageFile = null;
+
+                if (chatbot.voice_settings && chatbot.voice_settings.enabled) {
+                    const voiceProvider = chatbot.voice_settings.provider || null;
+
+                    const { generateSpeech } = await import('./voice-ai.service.js');
+                    console.log(`[Chatbot] Generating voice response via TTS...`);
+                    const ttsResult = await generateSpeech(finalReplyText, chatbot.voice_settings.voice_id, chatbot.api_key, chatbot.ai_model, voiceProvider);
+                    if (ttsResult && ttsResult.buffer) {
+                        messageTypeToSend = 'audio';
+                        messageFile = {
+                            buffer: ttsResult.buffer,
+                            mimetype: 'audio/mpeg',
+                            originalname: ttsResult.fileName || 'audio_message.mp3'
+                        };
+                    }
+                }
+
                 if (isOmnichannel) {
-                    await sendOmnichannelMessageHelper({
+                   await sendOmnichannelMessageHelper({
                         contactDoc,
                         messageType: 'text',
-                        text: aiResponse
+                        text: finalReplyText
                     });
                 } else {
                     await unifiedWhatsAppService.sendMessage(userId, {
                         recipientNumber: params.senderNumber,
-                        messageText: aiResponse,
-                        messageType: 'text',
+                        messageText: finalReplyText,
+                        messageType: messageTypeToSend,
+                        file: messageFile,
                         whatsappPhoneNumberId
                     });
                 }
+
+                contactDoc.ai_message_count = (contactDoc.ai_message_count || 0) + 1;
+                await contactDoc.save();
+
                 return;
             }
         }

@@ -35,8 +35,9 @@ async function uploadMediaToWhatsApp({
 
   const form = new FormData();
 
+  const whatsAppType = getWhatsAppTypeFromMime(finalMimeType);
   form.append("messaging_product", "whatsapp");
-  form.append("type", finalMimeType);
+  form.append("type", whatsAppType);
 
   const fileOptions = {
     filename: filename || 'file.bin',
@@ -57,20 +58,29 @@ async function uploadMediaToWhatsApp({
     bufferSize: buffer.length
   });
 
-  const response = await axios.post(
-    `https://graph.facebook.com/v19.0/${phone_number_id}/media`,
-    form,
-    {
-      headers: {
-        Authorization: `Bearer ${access_token}`,
-        ...form.getHeaders()
-      },
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity
-    }
-  );
+  try {
+    const response = await axios.post(
+      `https://graph.facebook.com/v19.0/${phone_number_id}/media`,
+      form,
+      {
+        headers: {
+          Authorization: `Bearer ${access_token}`,
+          ...form.getHeaders()
+        },
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity
+      }
+    );
 
-  return response.data.id;
+    return response.data.id;
+  } catch (err) {
+    let errorMsg = err.message;
+    if (err.response && err.response.data && err.response.data.error) {
+      errorMsg = err.response.data.error.message || err.response.data.error.error_user_msg || JSON.stringify(err.response.data.error);
+    }
+    console.error('[UploadMedia] Error uploading media to WhatsApp:', errorMsg);
+    throw new Error(`Media upload failed: ${errorMsg}`);
+  }
 }
 
 function getWhatsAppTypeFromMime(mime) {

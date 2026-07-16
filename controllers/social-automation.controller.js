@@ -83,10 +83,10 @@ export const getAutomations = async (req, res) => {
         if (platform) query.platform = platform;
 
         let automations = await SocialAutomation.find(query).sort({ created_at: -1 }).lean();
-        
+
         const mediaIds = automations.filter(a => a.target_media_id && a.target_media_id !== 'all').map(a => a.target_media_id);
         const mediaPosts = await SocialMediaPost.find({ media_id: { $in: mediaIds }, user_id: userId }).lean();
-        
+
         const mediaMap = mediaPosts.reduce((acc, post) => {
             acc[post.media_id] = post;
             return acc;
@@ -181,27 +181,27 @@ export const fetchMedia = async (req, res) => {
         if (platform === 'instagram') {
             connection = await InstagramConnection.findOne({ workspace_id: workspace_id, user_id: userId, is_active: true });
             if (!connection) return res.status(404).json({ success: false, error: 'Instagram connection not found' });
-            
+
             const accessToken = connection.access_token || connection.pages?.[0]?.page_access_token;
             const targetId = connection.global_instagram_account_id || connection.ig_user_id || connection.pages?.[0]?.instagram_account_id;
-            
+
             if (!accessToken || !targetId) {
                 return res.status(400).json({ success: false, error: 'Incomplete Instagram connection data' });
             }
-            targets.push({ accessToken, targetId, baseUrl: accessToken.startsWith('IGAA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com' });
-            
+            targets.push({ accessToken, targetId, baseUrl: accessToken.startsWith('IGA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com' });
+
         } else if (platform === 'facebook') {
             connection = await FacebookConnection.findOne({ workspace_id: workspace_id, user_id: userId, is_active: true });
             if (!connection) return res.status(404).json({ success: false, error: 'Facebook connection not found' });
-            
+
             const activePages = connection.pages?.filter(p => p.is_active !== false) || [];
             if (activePages.length === 0) {
                 return res.status(400).json({ success: false, error: 'No active Facebook pages found' });
             }
-            
+
             for (const page of activePages) {
                 if (page.page_access_token && page.page_id) {
-                    if (page_id && page.page_id !== page_id) continue; 
+                    if (page_id && page.page_id !== page_id) continue;
 
                     targets.push({
                         accessToken: page.page_access_token,
@@ -223,7 +223,7 @@ export const fetchMedia = async (req, res) => {
         for (const target of targets) {
             try {
                 let fieldsStr = 'id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,children{id,media_type,media_url,thumbnail_url},comments.limit(10){text,from}';
-                
+
                 if (platform === 'instagram' && media_type === 'story') {
                     fieldsStr = 'id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,children{id,media_type,media_url,thumbnail_url}';
                 } else if (platform === 'facebook') {
@@ -274,7 +274,7 @@ export const fetchMedia = async (req, res) => {
                                 permalink: item.permalink_url || '',
                                 timestamp: item.created_time || '',
                                 children: { data: [] },
-                                comments: { 
+                                comments: {
                                     data: (item.comments?.data || []).map(c => ({
                                         text: c.message,
                                         from: c.from
@@ -323,7 +323,7 @@ export const fetchMedia = async (req, res) => {
                         }
                     }
                 }
-                
+
                 if (media_type === 'reel') {
                     data = data.filter(item => item.media_product_type === 'REELS' || (item.permalink && item.permalink.includes('/reel/')));
                 } else if (media_type === 'post') {
@@ -474,7 +474,7 @@ export const retriggerComments = async (req, res) => {
             return res.status(400).json({ success: false, error: 'No active connection found for this platform' });
         }
 
-        const baseUrl = accessToken.startsWith('IGAA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
+        const baseUrl = accessToken.startsWith('IGA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
         const META_GRAPH_API_VERSION = 'v22.0';
 
         let comments = [];
@@ -509,7 +509,7 @@ export const retriggerComments = async (req, res) => {
             const commentText = comment.text || comment.message || '';
             const commentTimestamp = comment.timestamp || comment.created_time || '';
             const commentTime = new Date(commentTimestamp);
-            
+
             if (!commentText) continue;
             if (commentTime < sevenDaysAgo) continue;
             if (comment.from && comment.from.id === pageId) continue;

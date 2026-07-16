@@ -328,7 +328,7 @@ class SocialAutomationService {
                             { instagram_scoped_id: senderId }
                         ],
                         user_id: userId
-                        
+
                     });
 
                     if (!contact && !senderId.startsWith('fb_comment_')) {
@@ -490,7 +490,7 @@ class SocialAutomationService {
             }
             if (automation.auto_like_comment && commentId && pageAccessToken) {
                 try {
-                    const baseUrl = pageAccessToken.startsWith('IGAA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
+                    const baseUrl = pageAccessToken.startsWith('IGA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
                     await axios.post(`${baseUrl}/${META_GRAPH_API_VERSION}/${commentId}/likes`, null, {
                         params: { access_token: pageAccessToken }
                     });
@@ -502,7 +502,7 @@ class SocialAutomationService {
 
             if (automation.auto_reply_text && commentId && pageAccessToken) {
                 try {
-                    const baseUrl = pageAccessToken.startsWith('IGAA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
+                    const baseUrl = pageAccessToken.startsWith('IGA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
                     const isInstagram = platform === 'instagram';
                     const replyEdge = isInstagram ? 'replies' : 'comments';
 
@@ -560,7 +560,7 @@ class SocialAutomationService {
         if (shouldHide) {
             try {
                 const isInstagram = platform === 'instagram';
-                const baseUrl = pageAccessToken.startsWith('IGAA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
+                const baseUrl = pageAccessToken.startsWith('IGA') ? 'https://graph.instagram.com' : 'https://graph.facebook.com';
                 const payload = isInstagram ? { hide: true } : { is_hidden: true };
 
                 await axios.post(`${baseUrl}/${META_GRAPH_API_VERSION}/${commentId}`, null, {
