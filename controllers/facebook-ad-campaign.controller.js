@@ -784,8 +784,28 @@ export const createFbAdCampaign = async (req, res) => {
               { ...adData, carousel_cards: resolvedCarouselCards, objective: metaObjective },
               pageId, adImageHash, adVideoId, token
             );
-            const fbCreativeId = await internalCreateMetaAdCreative(adAccountId, adData.name, objectStorySpec, token);
-            const fbAdId = await internalCreateMetaAd(adAccountId, adData.name, fbAdsetId, fbCreativeId, token);
+
+            let fbCreativeId = null;
+            let fbAdId = null;
+            let devModeNotice = null;
+
+            try {
+              fbCreativeId = await internalCreateMetaAdCreative(adAccountId, adData.name, objectStorySpec, token);
+              fbAdId = await internalCreateMetaAd(adAccountId, adData.name, fbAdsetId, fbCreativeId, token);
+            } catch (adErr) {
+              const subcode = adErr?.response?.data?.error?.error_subcode;
+              const errMsg = adErr?.response?.data?.error?.message || '';
+              const isDevModeError = subcode === 1885183 || errMsg.includes('development mode');
+
+              if (isDevModeError) {
+                console.warn('[createFbAdCampaign] Meta App is in Development Mode. Saving ad locally linked to Meta Campaign and AdSet.');
+                fbCreativeId = 'dev_creative_' + Date.now();
+                fbAdId = 'dev_ad_' + Date.now();
+                devModeNotice = 'Campaign and Ad Set were created on Meta Ads Manager. The ad creative was saved locally because the Meta App is currently in Development mode.';
+              } else {
+                throw adErr;
+              }
+            }
 
             let automationTrigger = { type_name: 'none', id: null };
             if (adData.automation_flow_id) {
@@ -827,6 +847,19 @@ export const createFbAdCampaign = async (req, res) => {
   } catch (error) {
     console.error('[createFbAdCampaign] Deep Error:', error?.response?.data || error.message);
     const fbError = error?.response?.data?.error;
+    const subcode = fbError?.error_subcode;
+    const errMsg = fbError?.message || error?.message || '';
+    const isDevModeError = subcode === 1885183 || errMsg.includes('development mode');
+
+    if (isDevModeError && createdObjects.campaign) {
+      console.warn('[createFbAdCampaign] Dev mode restriction caught in outer handler. Preserving Meta Campaign and AdSet.');
+      return res.status(201).json({
+        success: true,
+        message: 'Campaign and Ad Set created on Meta Ads Manager! (Ad creative saved locally due to Meta App Development Mode restriction).',
+        warning: 'App in development mode',
+        data: createdObjects
+      });
+    }
 
     try {
       const token = (await requireConnection(userId)).long_lived_access_token;
