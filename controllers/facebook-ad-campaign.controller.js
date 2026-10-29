@@ -91,17 +91,28 @@ const downloadRemoteMedia = async (url, subDir = 'ads') => {
 
 
 const requirePage = async (fb_page_id, userId) => {
-  const page = await FacebookPage.findOne({
-    _id: fb_page_id,
-    user_id: userId,
-    is_active: true
-  }).lean();
+  let query = { user_id: userId };
+  if (fb_page_id) {
+    if (mongoose.Types.ObjectId.isValid(fb_page_id)) {
+      query.$or = [{ _id: fb_page_id }, { page_id: String(fb_page_id) }];
+    } else {
+      query.page_id = String(fb_page_id);
+    }
+  }
+
+  let page = fb_page_id ? await FacebookPage.findOne(query).lean() : null;
+
+  // Fallback: If not found by provided ID, try finding user's active page or any page
+  if (!page) {
+    page = await FacebookPage.findOne({ user_id: userId, is_active: true }).lean() ||
+           await FacebookPage.findOne({ user_id: userId }).lean();
+  }
 
   if (!page) {
     const err = new Error('FB_PAGE_NOT_FOUND');
     err.statusCode = 404;
     err.userMessage =
-      'Facebook page not found. Make sure the page belongs to your connected account.';
+      'Facebook page not found. Make sure you have at least one Facebook Page connected in your account.';
     throw err;
   }
   return page;
@@ -589,7 +600,15 @@ export const createFbAdCampaign = async (req, res) => {
 
     if (!fb_page_id) fb_page_id = connection.default_page_id;
 
-    if (!fb_page_id) return res.status(400).json({ success: false, error: 'fb_page_id is required' });
+    if (!fb_page_id) {
+      const defaultPage = await FacebookPage.findOne({ user_id: userId, is_active: true }).lean() ||
+                          await FacebookPage.findOne({ user_id: userId }).lean();
+      if (defaultPage) {
+        fb_page_id = defaultPage._id;
+      }
+    }
+
+    if (!fb_page_id) return res.status(400).json({ success: false, error: 'Facebook Page is required. Please connect a Facebook Page first.' });
     if (!ad_account_id) return res.status(400).json({ success: false, error: 'ad_account_id is required' });
     if (!name) return res.status(400).json({ success: false, error: 'name is required' });
 
@@ -680,6 +699,13 @@ export const createFbAdCampaign = async (req, res) => {
           if (aset.lifetime_budget) metaAsetParams.lifetime_budget = String(Math.round(Number(aset.lifetime_budget) * 100));
         }
 
+        if (aset.start_time) {
+          metaAsetParams.start_time = new Date(aset.start_time).toISOString();
+        }
+        if (aset.end_time) {
+          metaAsetParams.end_time = new Date(aset.end_time).toISOString();
+        }
+
         const fbAdsetId = await internalCreateMetaAdSet(adAccountId, metaAsetParams, token);
         const localAdSet = await FacebookAdSet.create({
           user_id: userId,
@@ -688,6 +714,8 @@ export const createFbAdCampaign = async (req, res) => {
           name: aset.name,
           targeting: adsetParams.targeting,
           daily_budget: aset.daily_budget ? Number(aset.daily_budget) : 0,
+          start_time: aset.start_time ? new Date(aset.start_time) : null,
+          end_time: aset.end_time ? new Date(aset.end_time) : null,
           status: 'paused',
           last_synced_at: new Date()
         });
@@ -827,7 +855,7 @@ export const createFbAdCampaign = async (req, res) => {
 
     return res.status(error.statusCode || 500).json({
       success: false,
-      error: 'Facebook ad creation failed',
+      error: fbError?.error_user_msg || fbError?.message || error.userMessage || 'Facebook ad creation failed',
       details: fbError?.message || error.message,
       fb_error: fbError ? {
         message: fbError.message,
